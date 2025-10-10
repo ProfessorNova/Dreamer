@@ -9,22 +9,38 @@ from gymnasium import register_envs
 
 @dataclass
 class Config:
-    # Environment and device settings
+    # --- Environment and device settings ---
     env_id: str = "ALE/Breakout-v5"
     device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Training parameters
-    total_timesteps: int = 1_000
+    # --- Training parameters ---
+    num_steps: int = 1_000_000
+    initial_random_steps: int = 1_000
+    batch_size: int = 32
 
-    # Logging and checkpointing
+    # optimizer
+    world_model_lr: float = 1e-4
+    actor_lr: float = 1e-4
+    critic_lr: float = 1e-4
+    train_every: int = 50
+
+    # buffer sizes
+    buffer_size: int = 1_000
+    seq_len: int = 50
+
+    # dreamer specific
+    imagination_horizon: int = 16
+
+    # --- Logging and checkpointing ---
     create_artifacts: bool = False
     run_dir: str = os.path.join("runs", datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S"))
     checkpoint_dir: str = os.path.join(run_dir, "checkpoints")
     log_interval: int = 1_000
+    video_interval: int = 10_000
     video_fps: int = 30
     video_max_frames: int = 1_000
 
-    # Random seed for reproducibility
+    # --- Random seed for reproducibility ---
     seed: int = 42
 
     def __post_init__(self) -> None:
