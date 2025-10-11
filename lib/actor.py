@@ -3,96 +3,36 @@ from typing import Tuple
 import torch
 import torch.nn as nn
 
-
-class ReturnScaler:
-    """
-    Maintain running range estimates of returns for normalization.
-
-    DreamerV3 normalizes returns to be roughly in [0, 1] but only scales
-    down large magnitudes while leaving small returns untouched.
-    This class tracks the 5th and 95th percentiles using an exponential
-    moving average and provides scaling factors for normalization.
-    """
-
-    def __init__(self, momentum: float = 0.99):
-        self.momentum = momentum
-        self.range = None
-
-    def update(self, returns: torch.Tensor) -> None:
-        # Compute percentiles along batch and time dimensions
-        p5 = torch.quantile(returns, 0.05).item()
-        p95 = torch.quantile(returns, 0.95).item()
-        current_range = max(p95 - p5, 1e-6)
-        if self.range is None:
-            self.range = current_range
-        else:
-            self.range = self.momentum * self.range + (1 - self.momentum) * current_range
-
-    def scale(self, returns: torch.Tensor) -> torch.Tensor:
-        if self.range is None:
-            return returns
-        # Only scale returns larger than 1 by dividing by the running range
-        return returns / max(1.0, self.range)
+from lib.nn_blocks import MLP
+from lib.utils import unimix_logits
 
 
 class Actor(nn.Module):
-    """Discrete action actor network."""
-
-    def __init__(self, feat_size: int, action_size: int, hidden_size: int = 400, entropy_scale: float = 3e-4):
+    def __init__(self, feat_size: int, action_size: int,
+                 entropy_scale: float = 1e-2, units: int = 256, depth: int = 16) -> None:
         super().__init__()
+        self.action_size = action_size
         self.entropy_scale = entropy_scale
-        self.fc = nn.Sequential(
-            nn.Linear(feat_size, hidden_size),
-            nn.ReLU(),
-            nn.Linear(hidden_size, hidden_size),
-            nn.ReLU(),
-            nn.Linear(hidden_size, action_size),
-        )
-        self.return_scaler = ReturnScaler()
+        self.mlp = MLP(feat_size, action_size, units=units, depth=depth)
 
-    def forward(self, feat: torch.Tensor) -> torch.distributions.Categorical:
-        logits = self.fc(feat)
-        return torch.distributions.Categorical(logits=logits)
+    def forward(self, feat: torch.Tensor, eps: float = 0.01) -> torch.distributions.Categorical:
+        logits = self.mlp(feat)
+        logp = unimix_logits(logits, eps)
+        return torch.distributions.Categorical(logits=logp)
 
     def act(self, feat: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Sample actions and return them along with log probabilities."""
         dist = self.forward(feat)
         action = dist.sample()
         log_prob = dist.log_prob(action)
         return action, log_prob
 
-    def loss(
-            self,
-            feats: torch.Tensor,
-            actions: torch.Tensor,
-            returns: torch.Tensor,
-            values: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        Compute the actor loss for a batch of imagined trajectories.
-
-        Args:
-            feats: Tensor of shape (batch, time, feat_size) representing model
-                features.
-            actions: Tensor of shape (batch, time) with sampled actions.
-            returns: Tensor of shape (batch, time) with λ‑returns (bootstrapped
-                future rewards) computed by the critic.
-            values: Tensor of shape (batch, time) with predicted values from the
-                critic.
-
-        Returns:
-            Scalar actor loss.
-        """
-        batch, time, feat_size = feats.size()
-        dist = self.forward(feats.view(-1, feat_size))
-        log_probs = dist.log_prob(actions.view(-1))
-        log_probs = log_probs.view(batch, time)
-        entropies = dist.entropy().view(batch, time)
-        # Compute advantage as normalized returns minus values
-        adv = returns - values
-        # Update return scaler and normalize advantages
-        self.return_scaler.update(returns.detach())
-        norm_adv = self.return_scaler.scale(adv)
-        # Actor loss: negative log likelihood weighted by advantage and entropy regularizer
-        loss = - (norm_adv.detach() * log_probs).mean() - self.entropy_scale * entropies.mean()
-        return loss
+    def loss(self, feats: torch.Tensor, actions: torch.Tensor, returns: torch.Tensor,
+             values: torch.Tensor) -> torch.Tensor:
+        b, t, f = feats.shape
+        dist = self.forward(feats.view(b * t, f))
+        log_probs = dist.log_prob(actions.view(-1)).view(b, t)
+        entropies = dist.entropy().view(b, t)
+        advantage = returns - values
+        adv_std = advantage.std().clamp(min=1e-3)
+        norm_adv = (advantage / adv_std).clamp(-5.0, 5.0)
+        return -(norm_adv.detach() * log_probs).mean() - self.entropy_scale * entropies.mean()

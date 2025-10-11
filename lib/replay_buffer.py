@@ -1,75 +1,81 @@
-"""
-Simple replay buffer for DreamerV3.
-
-This buffer stores episodes of experience and allows sampling of
-contiguous sequences for training the world model and imagined rollout
-starting states.  Each episode consists of observations, actions,
-rewards, and continuation flags (1 − done).  When sampling a batch,
-episodes are chosen uniformly and a random window of fixed length is
-extracted from each episode.
-"""
-from __future__ import annotations
-
-import random
-from collections import deque
-from typing import Dict
+from typing import Dict, Tuple
 
 import numpy as np
+import torch
 
 
 class ReplayBuffer:
-    def __init__(self, max_size: int = 1000, seq_len: int = 50):
-        self.max_size = max_size
+    """Cyclic replay buffer for sequence sampling."""
+
+    def __init__(
+            self,
+            capacity: int,
+            obs_shape: Tuple[int, ...],
+            action_dim: int,
+            seq_len: int,
+            device: torch.device
+    ) -> None:
+        self.capacity = int(capacity)
+        self.obs_shape = obs_shape
+        self.action_dim = action_dim
         self.seq_len = seq_len
-        self.buffer: deque = deque(maxlen=max_size)
+        self.device = device
 
-    def add_episode(self, obs: np.ndarray, actions: np.ndarray, rewards: np.ndarray, continues: np.ndarray) -> None:
-        """
-        Add a full episode to the buffer.
+        # We store observations as uint8 to save memory if images
+        self.observations = torch.empty((self.capacity, *obs_shape), dtype=torch.uint8)
+        self.next_observations = torch.empty((self.capacity, *obs_shape), dtype=torch.uint8)
 
-        Args:
-            obs: numpy array of shape (T+1, *obs_shape) containing observations.
-            actions: numpy array of shape (T,) containing integer actions.
-            rewards: numpy array of shape (T,) containing rewards.
-            continues: numpy array of shape (T,) containing continuation flags (1−done).
+        # Store actions as integers for discrete actions or as floats if continuous
+        self.actions = torch.empty((self.capacity, action_dim), dtype=torch.float32)
+        self.rewards = torch.empty(self.capacity, dtype=torch.float32)
+        self.dones = torch.empty(self.capacity, dtype=torch.bool)
+
+        self.idx = 0
+        self.full = False
+
+    def __len__(self) -> int:
+        return self.capacity if self.full else self.idx
+
+    def store(self, obs: np.ndarray, action: np.ndarray, reward: float, next_obs: np.ndarray, done: bool) -> None:
+        """Add a single transition to the buffer."""
+        self.observations[self.idx] = torch.as_tensor(obs, dtype=torch.uint8)
+        self.actions[self.idx] = torch.as_tensor(action, dtype=torch.float32)
+        self.rewards[self.idx] = reward
+        self.next_observations[self.idx] = torch.as_tensor(next_obs, dtype=torch.uint8)
+        self.dones[self.idx] = done
+
+        self.idx = (self.idx + 1) % self.capacity
+        if self.idx == 0:
+            self.full = True
+
+    def sample(self, batch_size: int) -> Dict[str, torch.Tensor]:
         """
-        self.buffer.append({
-            "obs": obs,  # includes final observation
+        Sample a batch of contiguous sequences.
+
+        Returns a dictionary containing sequences of observations,
+        actions, rewards, next observations and done flags.  Observations and
+        next observations are returned as floats in the range ``[0, 255]``.
+        """
+        assert len(self) >= self.seq_len, "Not enough data to sample."
+
+        # Determine the valid range of starting indices. We avoid sampling
+        # sequences that wrap around the end of the buffer.
+        max_start = self.capacity if self.full else self.idx - self.seq_len
+        assert max_start > 0, "Buffer is too small to sample the desired sequence length."
+        starts = np.random.randint(0, max_start, size=batch_size)
+        seq_range = np.arange(self.seq_len)
+        indices = (starts[:, None] + seq_range[None, :]) % self.capacity
+
+        obs = self.observations[indices].to(self.device).float()
+        actions = self.actions[indices].to(self.device)
+        rewards = self.rewards[indices].to(self.device)
+        next_obs = self.next_observations[indices].to(self.device).float()
+        dones = self.dones[indices].to(self.device)
+
+        return {
+            "observations": obs,
             "actions": actions,
             "rewards": rewards,
-            "continues": continues,
-        })
-
-    def sample_batch(self, batch_size: int) -> Dict[str, np.ndarray]:
-        """
-        Sample a batch of sequences for training.
-
-        Returns:
-            A dict containing obs, actions, rewards, continues each of shape
-            (batch, seq_len, ...).  Observations include seq_len consecutive
-            frames, so the returned obs has shape (batch, seq_len+1, *obs_shape).
-        """
-        assert len(self.buffer) > 0, "ReplayBuffer is empty"
-        batch_obs = []
-        batch_actions = []
-        batch_rewards = []
-        batch_continues = []
-        for _ in range(batch_size):
-            ep = random.choice(self.buffer)
-            # pick random start index such that we have seq_len transitions
-            max_start = len(ep["actions"]) - self.seq_len
-            if max_start <= 0:
-                start = 0
-            else:
-                start = random.randint(0, max_start)
-            end = start + self.seq_len
-            batch_obs.append(ep["obs"][start: end + 1])
-            batch_actions.append(ep["actions"][start:end])
-            batch_rewards.append(ep["rewards"][start:end])
-            batch_continues.append(ep["continues"][start:end])
-        return {
-            "obs": np.stack(batch_obs, axis=0),
-            "actions": np.stack(batch_actions, axis=0),
-            "rewards": np.stack(batch_rewards, axis=0),
-            "continues": np.stack(batch_continues, axis=0),
+            "next_observations": next_obs,
+            "dones": dones,
         }

@@ -1,11 +1,9 @@
 import time
-from typing import Dict
 
 import gymnasium as gym
-import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+from torch.nn.functional import one_hot
 
 from lib.actor import Actor
 from lib.config import Config
@@ -16,14 +14,6 @@ from lib.world_model import WorldModel
 
 
 def train(cfg: Config, summary_writer=None):
-    """
-    Dreamer-style training loop with:
-      - posterior update before acting (collect phase),
-      - imagination from the last posterior state of the WM batch,
-      - robust batching and logging.
-    """
-
-    # --- Environments ---
     env = make_env(cfg.env_id)
     eval_env = make_env(cfg.env_id)
 
@@ -37,250 +27,238 @@ def train(cfg: Config, summary_writer=None):
     print(f"Observation shape: {obs_shape}, Action size: {act_size}")
 
     # --- Models ---
-    world_model = WorldModel(obs_shape, act_size).to(cfg.device)
-    feat_size = world_model.deter_size + world_model.stoch_size  # must match Actor/Critic inputs
+    world_model = WorldModel(
+        obs_shape, act_size, cfg.embed_size, cfg.deter_size, cfg.stoch_size,
+        cfg.free_nats, cfg.beta_pred, cfg.beta_dyn, cfg.beta_rep,
+        units=cfg.mlp_units, depth=cfg.mlp_depth
+    ).to(cfg.device)
+    feat_size = cfg.deter_size + cfg.stoch_size
 
-    actor = Actor(feat_size, act_size).to(cfg.device)
-    critic = Critic(feat_size).to(cfg.device)
+    actor = Actor(
+        feat_size, act_size, entropy_scale=cfg.entropy_scale,
+        units=cfg.mlp_units, depth=cfg.mlp_depth
+    ).to(cfg.device)
 
-    # --- Optimizers ---
-    wm_opt = torch.optim.Adam(world_model.parameters(), lr=cfg.world_model_lr)
-    actor_opt = torch.optim.Adam(actor.parameters(), lr=cfg.actor_lr)
-    critic_opt = torch.optim.Adam(critic.parameters(), lr=cfg.critic_lr)
+    critic = Critic(
+        feat_size, num_bins=cfg.num_bins, ema_decay=cfg.ema_decay,
+        units=cfg.mlp_units, depth=cfg.mlp_depth
+    ).to(cfg.device)
 
     # --- Replay Buffer ---
-    buffer = ReplayBuffer(max_size=cfg.buffer_size, seq_len=cfg.seq_len)
+    buffer = ReplayBuffer(cfg.buffer_capacity, obs_shape, act_size, cfg.seq_len, cfg.device)
 
-    # --- Episode state ---
-    obs, _ = env.reset()
-    episode_obs = [obs]
-    episode_actions: list[int] = []
-    episode_rewards: list[float] = []
-    episode_continues: list[float] = []
+    # --- Optimizers ---
+    optim_model = torch.optim.Adam(world_model.parameters(), lr=cfg.world_model_lr)
+    optim_actor = torch.optim.Adam(actor.parameters(), lr=cfg.actor_lr)
+    optim_critic = torch.optim.Adam(critic.parameters(), lr=cfg.critic_lr)
 
-    # RSSM state and previous action (one-hot) for the collect loop
-    state: Dict[str, torch.Tensor] = world_model.init_state(batch_size=1, device=cfg.device)
-    prev_action_onehot = torch.zeros(1, act_size, device=cfg.device)
+    # --- Training Loop ---
+    time_counter = time.time()
+    iter_counter = 0
 
-    total_steps = 0
-    episode = 0
-    start_time = time.time()
+    env_steps = 0  # how many env steps have been taken
+    credit = 0.0  # how many gradient steps are owed
 
-    # Optional: sanity check to ensure model inputs/outputs align
-    assert actor.fc[0].in_features == feat_size, "Actor first layer input must equal feat_size"
-    assert critic.feat_size == feat_size, "Critic feature size must equal feat_size"
+    loss = None
+    actor_loss = None
+    critic_loss = None
 
-    while total_steps < cfg.num_steps:
-        # ---- Select action ----
-        if total_steps < cfg.initial_random_steps:
-            # Pure exploration for warm-up
-            action = env.action_space.sample()
-        else:
-            # 1) Posterior update with current observation before acting
-            with torch.no_grad():
-                # Turn current obs into tensor [1, C, H, W]
-                if isinstance(obs, np.ndarray) and obs.dtype == np.uint8:
-                    obs_t = torch.as_tensor(obs, dtype=torch.uint8, device=cfg.device)
-                else:
-                    obs_t = torch.as_tensor(obs, dtype=torch.float32, device=cfg.device)
-                if obs_t.ndim == 3:
-                    obs_t = obs_t.unsqueeze(0)
+    model_state = world_model.init_state(1, cfg.device)
+    last_action = torch.zeros(1, act_size, device=cfg.device)
 
-                # GRU update with [z_{t-1}, a_{t-1}]
-                gru_in = torch.cat([state["stoch"], prev_action_onehot], dim=-1)  # [1, stoch+act]
-                deter = world_model.rssm.gru(gru_in, state["deter"])  # [1, deter]
-
-                # Encode and posterior (q(z_t | h_t, x_t))
-                embed = world_model.encoder(obs_t)  # [1, embed]
-                mean_post, logstd_post = world_model.rssm._posterior(deter, embed)  # [1, stoch]
-                stoch = mean_post + torch.randn_like(mean_post) * logstd_post.exp()
-
-                state = {"deter": deter, "stoch": stoch}
-
-                # 2) Actor takes the proper feature [h_t, z_t]
-                feat = world_model.get_feat(state)  # [1, feat_size]
-                dist = actor(feat)
-                action = dist.sample().item()
-
-            # Update prev_action_onehot for the *next* RSSM update
-            prev_action_onehot = F.one_hot(torch.tensor([action], device=cfg.device),
-                                           num_classes=act_size).float()
-
-        # ---- Step environment ----
-        next_obs, reward, done, truncated, _ = env.step(action)
-        continue_flag = 0.0 if (done or truncated) else 1.0
-
-        # ---- Store transition in episode buffer ----
-        episode_actions.append(action)
-        episode_rewards.append(reward)
-        episode_continues.append(continue_flag)
-        episode_obs.append(next_obs)
-
-        total_steps += 1
-
-        # ---- Episode end handling ----
-        if done or truncated:
-            # Push full episode to replay
-            buffer.add_episode(
-                obs=np.stack(episode_obs, axis=0),  # (T+1, C, H, W)
-                actions=np.array(episode_actions, dtype=np.int64),  # (T,)
-                rewards=np.array(episode_rewards, dtype=np.float32),
-                continues=np.array(episode_continues, dtype=np.float32),
-            )
-            # Reset env and per-episode storage
+    current_obs = None
+    for it in range(cfg.num_iterations):
+        # --- Collect a single transition ---
+        if current_obs is None:
             obs, _ = env.reset()
-            episode_obs = [obs]
-            episode_actions = []
-            episode_rewards = []
-            episode_continues = []
+            current_obs = obs
+        # Create one‑hot action from last action index
+        # Sample action using actor on current world model state
+        with torch.no_grad():
+            # Update model state with latest observation embedding and last action
+            obs_tensor = torch.tensor(current_obs, dtype=torch.float32, device=cfg.device).unsqueeze(0)
+            # Perform posterior update
+            embed = world_model.encoder(obs_tensor)
+            belief = model_state['deter']
+            _, _, stoch_prior, belief = world_model.rssm.prior(model_state["stoch"], belief, last_action)
+            _, _, stoch_post = world_model.rssm.posterior(belief, embed)
+            model_state = {"deter": belief, "stoch": stoch_post}
+            feat = world_model.get_feat(model_state)
+            dist = actor(feat)
+            action_idx = dist.sample().item()
 
-            # Reset RSSM state and prev action at episode boundary
-            state = world_model.init_state(batch_size=1, device=cfg.device)
-            prev_action_onehot = torch.zeros(1, act_size, device=cfg.device)
+            # log real-env policy stats
+            if summary_writer is not None and it % cfg.log_interval == 0:
+                ent_env = dist.entropy().mean().item()
+                summary_writer.add_scalar("policy/env_entropy", ent_env, it)
+                summary_writer.add_histogram("policy/env_probs", dist.probs, it)
 
-            episode += 1
-            # continue to next while-iteration
-            continue
-        else:
-            # Continue episode
-            obs = next_obs
+        # interact with environment
+        next_obs, reward, terminated, truncated, _ = env.step(action_idx)
+        done = terminated or truncated
 
-        # ---- Periodic training ----
-        wm_loss = None
-        actor_loss = None
-        critic_loss = None
+        # Store transition in replay buffer
+        a_onehot = torch.nn.functional.one_hot(
+            torch.tensor(action_idx, device=cfg.device), num_classes=act_size
+        ).float()
+        buffer.store(current_obs, a_onehot.cpu().numpy(), float(reward), next_obs, done)
 
-        ready_for_train = (
-                total_steps >= cfg.initial_random_steps and
-                total_steps % cfg.train_every == 0 and
-                len(buffer.buffer) > 0
-        )
-        if ready_for_train:
-            batch = buffer.sample_batch(cfg.batch_size)
+        current_obs = next_obs
+        last_action = a_onehot.unsqueeze(0)
+        env_steps += 1
+        if done:
+            current_obs, _ = env.reset()
+            model_state = world_model.init_state(1, cfg.device)
+            last_action = torch.zeros(1, act_size, device=cfg.device)
 
-            # Prepare tensors
-            # obs_batch shape: (B, L+1, C, H, W) typically, we train WM on L steps using obs[:-1] as inputs
-            obs_batch = torch.as_tensor(batch["obs"], dtype=torch.float32, device=cfg.device)
-            actions_batch = torch.as_tensor(batch["actions"], dtype=torch.int64, device=cfg.device)  # (B, L)
-            rewards_batch = torch.as_tensor(batch["rewards"], dtype=torch.float32, device=cfg.device)  # (B, L)
-            continues_batch = torch.as_tensor(batch["continues"], dtype=torch.float32, device=cfg.device)  # (B, L)
+        if len(buffer) > max(cfg.batch_size, cfg.seq_len) and env_steps >= cfg.warmup_steps:
+            # Grant credit for the new policy step
+            credit += cfg.train_ratio / cfg.action_repeat
+            credit = min(credit, cfg.max_credit)
 
-            # One-hot actions for WM
-            one_hot_actions = F.one_hot(actions_batch.long(), num_classes=act_size).float()  # (B, L, A)
+            # Decide how many steps to run now
+            steps_to_do = min(int(credit), cfg.max_steps_per_iter)
 
-            # Align lengths if obs_batch includes T+1 frames:
-            # Use obs_batch[:, :-1] so we have L frames; then ensure others are also L
-            if obs_batch.size(1) == actions_batch.size(1) + 1:
-                obs_inputs = obs_batch[:, :-1]  # (B, L, C, H, W)
-            else:
-                obs_inputs = obs_batch  # already aligned
+            # --- train the world model ---
+            for grad_step in range(steps_to_do):
+                batch = buffer.sample(cfg.batch_size)
+                obs = batch["observations"]
+                actions = batch["actions"]
+                rewards = batch["rewards"]
+                dones = batch["dones"]
+                continues = (~dones).float()
 
-            # World model training
-            wm_opt.zero_grad()
-            prev_state = world_model.init_state(obs_inputs.size(0), device=cfg.device)
+                state = world_model.init_state(cfg.batch_size, cfg.device)
+                loss, _, _ = world_model.loss(obs, actions, rewards, continues, state)
 
-            wm_loss, post, prior = world_model.loss(
-                obs_inputs,  # (B, L, C, H, W)
-                one_hot_actions,  # (B, L, A)
-                rewards_batch,  # (B, L)
-                continues_batch,  # (B, L)
-                prev_state,
-            )
-            wm_loss.backward()
-            nn.utils.clip_grad_norm_(world_model.parameters(), 100.0)
-            wm_opt.step()
+                optim_model.zero_grad()
+                loss.backward()
+                nn.utils.clip_grad_norm_(world_model.parameters(), 100.0)
+                optim_model.step()
 
-            # ---- Imagination: start from last posterior state of the WM batch ----
-            with torch.no_grad():
-                # post is a list[dict] of length L; we take the last dict for all batch items
-                last_post = {
-                    "deter": post[-1]["deter"].detach(),  # (B, deter)
-                    "stoch": post[-1]["stoch"].detach(),  # (B, stoch)
+                # --- actor-critic in imagination ---
+                batch = buffer.sample(cfg.batch_size)
+                obs = batch["observations"]
+                actions = batch["actions"]
+
+                state0 = world_model.init_state(cfg.batch_size, cfg.device)
+                embeds = world_model.encoder(obs)
+                post, _ = world_model.rssm.observe(embeds, actions, state0)
+                last_state = {
+                    "deter": torch.stack([s["deter"] for s in post], dim=1)[:, -1],
+                    "stoch": torch.stack([s["stoch"] for s in post], dim=1)[:, -1],
                 }
 
-            # Build imagined rollout by sampling actions from the actor
-            imag_actions = []
-            imag_states = []
+                with torch.no_grad():
+                    # roll out imagination
+                    state = {"deter": last_state["deter"].clone(), "stoch": last_state["stoch"].clone()}
+                    feats_list, actions_list = [], []
+                    B = state["stoch"].size(0)
 
-            state_imag = {k: v.clone() for k, v in last_post.items()}  # start state (B, *)
-            B = state_imag["deter"].size(0)
+                    for t in range(cfg.imagination_horizon):
+                        feat = world_model.get_feat(state)
+                        dist_im_t = actor(feat)
+                        action = dist_im_t.sample()
+                        if action.dim() == 0: action = action.view(1)
+                        if action.size(0) != B: action = action.expand(B)
+                        a_onehot = one_hot(action, num_classes=act_size).float()
+                        feats_list.append(feat)
+                        actions_list.append(action)
+                        _, _, stoch, deter = world_model.rssm.prior(state["stoch"], state["deter"], a_onehot)
+                        state = {"deter": deter, "stoch": stoch}
 
-            for _t in range(cfg.imagination_horizon):
-                feat_t = world_model.get_feat(state_imag)  # (B, feat_size)
-                dist_t = actor(feat_t)
-                act_t = dist_t.sample()  # (B,)
-                imag_actions.append(act_t)
+                    imag_feats = torch.stack(feats_list, dim=1)  # (B,H,F)
+                    imag_actions = torch.stack(actions_list, dim=1)  # (B,H)
+                    B, H, F = imag_feats.shape
+                    flat = imag_feats.view(B * H, F)
+                    deter_flat, stoch_flat = flat[:, :cfg.deter_size], flat[:, cfg.deter_size:]
 
-                # Convert action to one-hot (B, 1, A)
-                act_oh = F.one_hot(act_t, num_classes=act_size).float().unsqueeze(1)
-                # Imagine one step ahead
-                priors = world_model.rssm.imagine(act_oh, state_imag)  # list of length 1
-                state_imag = {
-                    "deter": priors[0]["deter"],
-                    "stoch": priors[0]["stoch"],
-                }
-                imag_states.append(state_imag)
+                    rewards_pred = world_model.reward_predictor(deter_flat, stoch_flat).view(B, H)
+                    continues_pred = torch.sigmoid(
+                        world_model.continue_predictor(deter_flat, stoch_flat)).view(B, H)
 
-            # Stack imagined tensors
-            imag_actions = torch.stack(imag_actions, dim=1)  # (B, T)
-            imag_feats = torch.stack([world_model.get_feat(s) for s in imag_states], dim=1)  # (B, T, feat)
-            imag_rewards = torch.stack(
-                [world_model.reward_predictor(s["deter"], s["stoch"]) for s in imag_states], dim=1  # (B, T)
-            )
-            imag_cont = torch.stack(
-                [torch.sigmoid(world_model.continue_predictor(s["deter"], s["stoch"])) for s in imag_states], dim=1
-            )  # (B, T)
+                    values_targ = critic.value(flat, use_target=True).view(B, H)
+                    bootstrap_targ = critic.value(world_model.get_feat(state), use_target=True)
 
-            # Critic target values (from EMA/target head)
-            with torch.no_grad():
-                values = critic.value(
-                    imag_feats.reshape(-1, imag_feats.size(-1)), use_target=True
-                ).view(imag_feats.size(0), imag_feats.size(1))  # (B, T)
+                    # compute lambda-returns
+                    lambda_returns = torch.zeros_like(values_targ)
+                    values_all = torch.cat([values_targ, bootstrap_targ.unsqueeze(1)], dim=1)
+                    next_return = bootstrap_targ
+                    for i in reversed(range(H)):
+                        discount = cfg.gamma * continues_pred[:, i].clamp(0.8, 1.0)
+                        td = rewards_pred[:, i] + discount * values_all[:, i + 1] - values_all[:, i]
+                        next_return = values_all[:, i] + cfg.lam * td + (1 - cfg.lam) * discount * next_return
+                        lambda_returns[:, i] = next_return
 
-            # Bootstrapped lambda-returns
-            lam = 0.95
-            discount = 0.997
-            returns = torch.zeros_like(imag_rewards)  # (B, T)
-            next_value = values[:, -1]
-            for t in reversed(range(cfg.imagination_horizon)):
-                r = imag_rewards[:, t]
-                c = imag_cont[:, t]
-                v = values[:, t]
-                next_value = r + discount * (c * ((1.0 - lam) * v + lam * next_value))
-                returns[:, t] = next_value
+                imag_feats_det = imag_feats.detach()
+                values_online = critic.value(flat, use_target=False).view(B, H).detach()
+                advantages = (lambda_returns - values_online)
 
-            # ---- Actor update ----
-            actor_opt.zero_grad()
-            actor_loss = actor.loss(
-                imag_feats.detach(), imag_actions.detach(), returns.detach(), values.detach()
-            )
-            actor_loss.backward()
-            nn.utils.clip_grad_norm_(actor.parameters(), 100.0)
-            actor_opt.step()
+                # ---- Critic update ----
+                critic_loss = critic.loss(imag_feats_det, lambda_returns.detach())
+                optim_critic.zero_grad(set_to_none=True)
+                critic_loss.backward()
+                nn.utils.clip_grad_norm_(critic.parameters(), 100.0)
+                optim_critic.step()
+                critic.update_target()
 
-            # ---- Critic update ----
-            critic_opt.zero_grad()
-            critic_loss = critic.loss(imag_feats.detach(), returns.detach())
-            critic_loss.backward()
-            nn.utils.clip_grad_norm_(critic.parameters(), 100.0)
-            critic_opt.step()
-            critic.update_target()
+                # ---- Actor update ----
+                actor_loss = actor.loss(imag_feats_det, imag_actions, lambda_returns.detach(), values_online)
+                optim_actor.zero_grad(set_to_none=True)
+                actor_loss.backward()
+                nn.utils.clip_grad_norm_(actor.parameters(), 100.0)
+                optim_actor.step()
 
-        # ---- Logging ----
-        if summary_writer is not None:
-            if total_steps % cfg.log_interval == 0 and wm_loss is not None:
-                elapsed = time.time() - start_time
-                steps_per_sec = total_steps / max(1e-6, elapsed)
-                summary_writer.add_scalar("perf/steps_per_sec", steps_per_sec, total_steps)
-                summary_writer.add_scalar("train/world_model_loss", wm_loss.item(), total_steps)
+                # Pay back the owed credit
+                credit -= 1.0
+
+                # ---- Rich logging ----
+                if summary_writer is not None and it % cfg.log_interval == 0 and grad_step == steps_to_do - 1:
+                    with torch.no_grad():
+                        dist_im = actor(imag_feats_det.view(-1, imag_feats_det.size(-1)))
+                        ent_im = dist_im.entropy().mean().item()
+                        adv_vec = advantages.view(-1)
+                        vals_vec = values_online.view(-1)
+                        rew_vec = rewards_pred.view(-1)
+                        cont_vec = continues_pred.view(-1)
+
+                    summary_writer.add_scalar("policy/imag_entropy", ent_im, it)
+                    summary_writer.add_histogram("policy/imag_probs", dist_im.probs, it)
+                    summary_writer.add_scalar("value/online_mean", vals_vec.mean().item(), it)
+                    summary_writer.add_scalar(
+                        "value/online_std", vals_vec.std(unbiased=False).item(), it)
+                    summary_writer.add_scalar("returns/lambda_mean", lambda_returns.mean().item(), it)
+                    summary_writer.add_scalar(
+                        "returns/lambda_std", lambda_returns.std(unbiased=False).item(), it)
+                    summary_writer.add_scalar("adv/mean", adv_vec.mean().item(), it)
+                    summary_writer.add_scalar("adv/std", adv_vec.std(unbiased=False).item(), it)
+                    summary_writer.add_scalar("reward_pred/mean", rew_vec.mean().item(), it)
+                    summary_writer.add_scalar("reward_pred/std", rew_vec.std(unbiased=False).item(), it)
+                    summary_writer.add_scalar("continue_pred/mean", cont_vec.mean().item(), it)
+
+        # ---- Console + scalar logs ----
+        if it % cfg.log_interval == 0 and it > 0 and loss is not None:
+            elapsed = time.time() - time_counter
+            time_counter = time.time()
+            iters_per_second = iter_counter / elapsed
+            iter_counter = 0
+            print(f"Iters {it}, WM Loss: {loss.item():.3f}, "
+                  f"Actor Loss: {actor_loss.item():.3f}, "
+                  f"Critic Loss: {critic_loss.item():.3f}, "
+                  f"Iters/sec: {iters_per_second:.3f}")
+            if summary_writer is not None:
+                summary_writer.add_scalar("perf/iters_per_second", iters_per_second, it)
+                summary_writer.add_scalar("train/world_model_loss", loss.item(), it)
                 if actor_loss is not None:
-                    summary_writer.add_scalar("train/actor_loss", actor_loss.item(), total_steps)
+                    summary_writer.add_scalar("train/actor_loss", actor_loss.item(), it)
                 if critic_loss is not None:
-                    summary_writer.add_scalar("train/critic_loss", critic_loss.item(), total_steps)
+                    summary_writer.add_scalar("train/critic_loss", critic_loss.item(), it)
 
-            # Periodic evaluation video
-            if total_steps % cfg.video_interval == 0 and total_steps > 0:
-                log_episode_video(cfg, summary_writer, eval_env, world_model, actor, total_steps)
+        # Periodic evaluation video
+        if it % cfg.video_interval == 0 and it > 0 and summary_writer is not None and env_steps >= cfg.warmup_steps:
+            log_episode_video(cfg, summary_writer, eval_env, world_model, actor, it)
+
+        iter_counter += 1
 
     env.close()
     eval_env.close()
