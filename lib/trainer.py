@@ -9,7 +9,8 @@ from lib.actor import Actor
 from lib.config import Config
 from lib.critic import Critic
 from lib.replay_buffer import ReplayBuffer
-from lib.utils import log_episode_video, make_env
+from lib.utils import log_episode_video, make_env, log_wm_recon_video, log_wm_openloop_video_teacher, \
+    log_wm_openloop_video_actor
 from lib.world_model import WorldModel
 
 
@@ -44,6 +45,14 @@ def train(cfg: Config, summary_writer=None):
         feat_size, num_bins=cfg.num_bins, ema_decay=cfg.ema_decay, ema_reg=cfg.ema_reg,
         units=cfg.mlp_units, depth=cfg.mlp_depth
     ).to(cfg.device)
+
+    # print model sizes
+    def count_params(model):
+        return sum(p.numel() for p in model.parameters())
+
+    print(f"World Model parameters: {count_params(world_model):,}")
+    print(f"Actor parameters: {count_params(actor):,}")
+    print(f"Critic parameters: {count_params(critic):,}")
 
     # --- Replay Buffer ---
     buffer = ReplayBuffer(cfg.buffer_capacity, obs_shape, act_size, cfg.seq_len, cfg.device)
@@ -261,7 +270,14 @@ def train(cfg: Config, summary_writer=None):
 
         # Periodic evaluation video
         if it % cfg.video_interval == 0 and it > 0 and summary_writer is not None and env_steps >= cfg.warmup_steps:
+            world_model.eval()
+            actor.eval()
+            log_wm_recon_video(cfg, summary_writer, world_model, buffer, it, seq_len=64)
+            log_wm_openloop_video_teacher(cfg, summary_writer, world_model, buffer, it, context=16, horizon=48)
+            log_wm_openloop_video_actor(cfg, summary_writer, world_model, actor, buffer, it, context=16, horizon=48)
             log_episode_video(cfg, summary_writer, eval_env, world_model, actor, it)
+            world_model.train()
+            actor.train()
 
         iter_counter += 1
 

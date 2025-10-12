@@ -40,8 +40,8 @@ class Config:
 
     # network architecture
     embed_size: int = 1024
-    deter_size: int = 200
-    stoch_size: int = 30
+    deter_size: int = 512
+    stoch_size: int = 32
     mlp_units: int = 512
     mlp_depth: int = 4
     entropy_scale: float = 3e-4
@@ -58,7 +58,7 @@ class Config:
     checkpoint_dir: str = os.path.join(run_dir, "checkpoints")
     log_interval: int = 1000
     video_interval: int = 10_000
-    video_fps: int = 30
+    video_fps: int = 15
     video_max_frames: int = 1000
 
     # --- Random seed for reproducibility ---

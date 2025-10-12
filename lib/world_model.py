@@ -433,12 +433,35 @@ class WorldModel(nn.Module):
         flat_stoch = stoch_post.reshape(b * t, -1)
 
         recon = self.decoder(flat_deter, flat_stoch)
-        if recon.dim() == 4:  # image
+        if recon.dim() == 4:  # images: recon is (b*t, C, H, W)
             recon = recon.view(b, t, *recon.shape[1:])
-            recon_loss = F.mse_loss(recon, obs.float() / 255.0, reduction="none").mean(dim=(2, 3, 4)).mean()
-        else:  # vector
+            target = (obs.float() / 255.0)
+
+            # --- Smooth L1 (Huber) with delta=0.1 (good for small objects) ---
+            perpx = F.smooth_l1_loss(recon, target, beta=0.1, reduction="none")  # (b, t, C, H, W)
+
+            # --- motion weighting (emphasize moving pixels) ---
+            with torch.no_grad():
+                # temporal absolute diff magnitude in grayscale
+                gray = target.mean(dim=2, keepdim=True)  # (b, t, 1, H, W)
+                # weight t>=1 by motion; t=0 uses the same weight as t=1
+                motion = torch.zeros_like(gray)
+                motion[:, 1:] = (gray[:, 1:] - gray[:, :-1]).abs()
+                motion[:, 0] = motion[:, 1]
+                # normalize and floor the weight (0.1–1.0)
+                w = motion / (motion.amax(dim=(2, 3, 4), keepdim=True).clamp_min(1e-6))
+                w = w.clamp_(0.0, 1.0) * 0.9 + 0.1
+
+            # apply weighting (broadcast over channels)
+            perpx = perpx * w
+
+            # average over C,H,W then (b,t)
+            recon_loss = perpx.mean(dim=(2, 3, 4)).mean()
+
+        else:  # vector observations
             recon = recon.view(b, t, -1)
-            recon_loss = F.mse_loss(recon, obs.float(), reduction="none").mean(dim=2).mean()
+            target = obs.float()
+            recon_loss = F.smooth_l1_loss(recon, target, beta=0.1, reduction="none").mean(dim=2).mean()
 
         reward_logits = self.reward_predictor(flat_deter, flat_stoch)  # (b*t, K)
         y_symlog = symlog(rewards.reshape(-1))
