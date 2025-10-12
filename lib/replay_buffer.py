@@ -49,20 +49,20 @@ class ReplayBuffer:
             self.full = True
 
     def sample(self, batch_size: int) -> Dict[str, torch.Tensor]:
-        """
-        Sample a batch of contiguous sequences.
-
-        Returns a dictionary containing sequences of observations,
-        actions, rewards, next observations and done flags.  Observations and
-        next observations are returned as floats in the range ``[0, 255]``.
-        """
         assert len(self) >= self.seq_len, "Not enough data to sample."
 
-        # Determine the valid range of starting indices. We avoid sampling
-        # sequences that wrap around the end of the buffer.
-        max_start = self.capacity if self.full else self.idx - self.seq_len
-        assert max_start > 0, "Buffer is too small to sample the desired sequence length."
-        starts = np.random.randint(0, max_start, size=batch_size)
+        if self.full:
+            # valid starts are every index except the last (seq_len - 1) positions before idx
+            # build valid starts in absolute space then map modulo capacity
+            valid_count = self.capacity - self.seq_len
+            base = (np.arange(valid_count) + self.idx) % self.capacity
+            starts = np.random.choice(base, size=batch_size, replace=True)
+        else:
+            # we can start at [0 ... idx - seq_len]
+            max_start = self.idx - self.seq_len
+            assert max_start >= 0
+            starts = np.random.randint(0, max_start + 1, size=batch_size)
+
         seq_range = np.arange(self.seq_len)
         indices = (starts[:, None] + seq_range[None, :]) % self.capacity
 
@@ -73,9 +73,9 @@ class ReplayBuffer:
         dones = self.dones[indices].to(self.device)
 
         return {
-            "observations": obs,
-            "actions": actions,
-            "rewards": rewards,
-            "next_observations": next_obs,
-            "dones": dones,
+            "observations": obs.contiguous(),
+            "actions": actions.contiguous(),
+            "rewards": rewards.contiguous(),
+            "next_observations": next_obs.contiguous(),
+            "dones": dones.contiguous(),
         }

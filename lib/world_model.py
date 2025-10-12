@@ -5,11 +5,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
-from lib.nn_blocks import MLP
+from lib.critic import value_bins, symexp, symlog, two_hot_encode
+from lib.nn_blocks import ResidualMLP
 
 
 class Encoder(nn.Module):
-    """Encode image or vector observations into a fixed‑size embedding.
+    """
+    Encode image or vector observations into a fixed‑size embedding.
 
     If the observation has three dimensions it is assumed to be an image in
     (C, H, W) format and a small convolutional network is used.  Otherwise a
@@ -51,7 +53,8 @@ class Encoder(nn.Module):
         return int(o.nelement() / o.size(0))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Encode observations.
+        """
+        Encode observations.
 
         Args:
             x: A tensor of shape ``(B, *obs_shape)`` or ``(B, T, *obs_shape)``.
@@ -108,18 +111,11 @@ class RSSMPrior(nn.Module):
         self.deter_size = deter_size
         self.scale_lb = scale_lb
         hid = hidden_size or deter_size
-        # MLP to project [z, a] into hidden space for the GRU
-        self.action_state_projector = nn.Sequential(
-            nn.Linear(stoch_size + action_size, hid),
-            nn.ELU(inplace=True),
-        )
+        # ResidualMLP to project [z, a] into hidden space for the GRU
+        self.action_state_projector = ResidualMLP(in_dim=stoch_size + action_size, out_dim=hid, units=hid, depth=2)
         self.rnn = nn.GRUCell(hid, deter_size)
-        # MLP to map belief to Gaussian parameters
-        self.rnn_to_prior_projector = nn.Sequential(
-            nn.Linear(deter_size, hid),
-            nn.ELU(inplace=True),
-            nn.Linear(hid, 2 * stoch_size),
-        )
+        # ResidualMLP to map belief to Gaussian parameters
+        self.rnn_to_prior_projector = ResidualMLP(in_dim=deter_size, out_dim=2 * stoch_size, units=hid, depth=2)
 
     def forward(
             self,
@@ -176,11 +172,7 @@ class RSSMPosterior(nn.Module):
         self.embed_size = embed_size
         self.stoch_size = stoch_size
         self.scale_lb = scale_lb
-        self.mlp = nn.Sequential(
-            nn.Linear(deter_size + embed_size, hid),
-            nn.ELU(inplace=True),
-            nn.Linear(hid, 2 * stoch_size),
-        )
+        self.mlp = ResidualMLP(in_dim=deter_size + embed_size, out_dim=2 * stoch_size, units=hid, depth=2)
 
     def forward(self, belief: torch.Tensor, embed: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         params = self.mlp(torch.cat([belief, embed], dim=-1))
@@ -352,18 +344,30 @@ class Decoder(nn.Module):
 
 
 class RewardPredictor(nn.Module):
-    def __init__(self, deter_size: int, stoch_size: int, units: int = 256, depth: int = 4) -> None:
+    def __init__(self, deter_size: int, stoch_size: int, units: int = 256, depth: int = 3,
+                 num_bins: int = 255) -> None:
         super().__init__()
-        self.mlp = MLP(deter_size + stoch_size, 1, units=units, depth=depth)
+        self.num_bins = num_bins
+        self.register_buffer("bins_symlog", value_bins(num_bins), persistent=False)
+        self.mlp = ResidualMLP(deter_size + stoch_size, num_bins, units=units, depth=depth, zero_init=True)
 
     def forward(self, deter: torch.Tensor, stoch: torch.Tensor) -> torch.Tensor:
-        return self.mlp(torch.cat([deter, stoch], dim=-1)).squeeze(-1)
+        # returns logits over bins
+        return self.mlp(torch.cat([deter, stoch], dim=-1))
+
+    @torch.no_grad()
+    def value(self, deter: torch.Tensor, stoch: torch.Tensor) -> torch.Tensor:
+        # expected reward from logits (used for λ-returns in imagination)
+        logits = self.forward(deter, stoch)
+        probs = logits.softmax(dim=-1)
+        exp_symlog = (probs * self.bins_symlog).sum(dim=-1)
+        return symexp(exp_symlog)
 
 
 class ContinuePredictor(nn.Module):
-    def __init__(self, deter_size: int, stoch_size: int, units: int = 256, depth: int = 4) -> None:
+    def __init__(self, deter_size: int, stoch_size: int, units: int = 256, depth: int = 3) -> None:
         super().__init__()
-        self.mlp = MLP(deter_size + stoch_size, 1, units=units, depth=depth)
+        self.mlp = ResidualMLP(deter_size + stoch_size, 1, units=units, depth=depth)
 
     def forward(self, deter: torch.Tensor, stoch: torch.Tensor) -> torch.Tensor:
         return self.mlp(torch.cat([deter, stoch], dim=-1)).squeeze(-1)
@@ -373,7 +377,7 @@ class WorldModel(nn.Module):
     def __init__(self, obs_shape: Tuple[int, ...], action_size: int,
                  embed_size: int = 1024, deter_size: int = 200, stoch_size: int = 30,
                  free_nats: float = 1.0, beta_pred: float = 1.0, beta_dyn: float = 0.5, beta_rep: float = 0.1,
-                 units: int = 256, depth: int = 4) -> None:
+                 units: int = 256, depth: int = 3) -> None:
         super().__init__()
         self.encoder = Encoder(obs_shape, embed_size)
         self.rssm = RSSM(action_size, embed_size, deter_size, stoch_size)
@@ -384,7 +388,6 @@ class WorldModel(nn.Module):
         self.beta_pred = beta_pred
         self.beta_dyn = beta_dyn
         self.beta_rep = beta_rep
-        self.kl_balance = 0.8  # common Dreamer balance
         self.deter_size = deter_size
         self.stoch_size = stoch_size
 
@@ -430,15 +433,20 @@ class WorldModel(nn.Module):
         flat_stoch = stoch_post.reshape(b * t, -1)
 
         recon = self.decoder(flat_deter, flat_stoch)
-        if recon.dim() == 4:
+        if recon.dim() == 4:  # image
             recon = recon.view(b, t, *recon.shape[1:])
-            recon_loss = F.mse_loss(recon, obs.float(), reduction="none").mean(dim=(2, 3, 4)).mean()
-        else:
+            recon_loss = F.mse_loss(recon, obs.float() / 255.0, reduction="none").mean(dim=(2, 3, 4)).mean()
+        else:  # vector
             recon = recon.view(b, t, -1)
             recon_loss = F.mse_loss(recon, obs.float(), reduction="none").mean(dim=2).mean()
 
-        reward_pred = self.reward_predictor(flat_deter, flat_stoch).view(b, t)
-        reward_loss = F.mse_loss(reward_pred, rewards, reduction="none").mean()
+        reward_logits = self.reward_predictor(flat_deter, flat_stoch)  # (b*t, K)
+        y_symlog = symlog(rewards.reshape(-1))
+        min_bin, max_bin = self.reward_predictor.bins_symlog[[0, -1]]
+        y_symlog = y_symlog.clamp(min_bin.item(), max_bin.item())
+        target_twohot = two_hot_encode(y_symlog, self.reward_predictor.bins_symlog)
+
+        reward_loss = -(target_twohot.detach() * reward_logits.log_softmax(dim=-1)).sum(dim=-1).mean()
 
         cont_pred = self.continue_predictor(flat_deter, flat_stoch).view(b, t)
         cont_loss = F.binary_cross_entropy_with_logits(cont_pred, continues, reduction="none").mean()
@@ -449,7 +457,6 @@ class WorldModel(nn.Module):
         std_prior = torch.stack([s["std"] for s in prior], dim=1).view(b * t, -1)
 
         kl_dyn, kl_rep = self._kl_split(mean_post, std_post, mean_prior, std_prior)
-
-        pred_loss = recon_loss + reward_loss + cont_loss  # continue folded into prediction
+        pred_loss = recon_loss + reward_loss + cont_loss
         total = self.beta_pred * pred_loss + self.beta_dyn * kl_dyn + self.beta_rep * kl_rep
         return total, post, prior

@@ -4,36 +4,21 @@ import torch
 from tensorboardX import SummaryWriter
 from torch.nn.functional import softmax
 
+from lib.actor import Actor
 from lib.config import Config
+from lib.world_model import WorldModel
 
 
 class ImageToPyTorch(gym.ObservationWrapper):
-    """
-    Wrapper to change image format from HWC (Height, Width, Channels) to CHW (Channels, Height, Width).
-
-    Args:
-        env (gym.Env): The environment to wrap.
-    """
-
     def __init__(self, env):
-        super(ImageToPyTorch, self).__init__(env)
-        old_shape = self.observation_space.shape
-        new_shape = (old_shape[-1], old_shape[0], old_shape[1])
+        super().__init__(env)
+        h, w, c = self.observation_space.shape
         self.observation_space = gym.spaces.Box(
-            low=0.0, high=1.0, shape=new_shape, dtype=np.float32
+            low=0, high=255, shape=(c, h, w), dtype=np.uint8
         )
 
     def observation(self, observation):
-        """
-        Convert observation from HWC to CHW format.
-
-        Args:
-            observation: The original observation in HWC format.
-
-        Returns:
-            The observation in CHW format.
-        """
-        return np.transpose(observation, axes=(2, 0, 1))
+        return np.transpose(observation, (2, 0, 1))
 
 
 def unimix_logits(logits: torch.Tensor, eps: float = 0.01) -> torch.Tensor:
@@ -44,8 +29,11 @@ def unimix_logits(logits: torch.Tensor, eps: float = 0.01) -> torch.Tensor:
     return torch.log(mixed.clamp_min(1e-12))
 
 
-def make_env(env_id: str = None) -> gym.Env:
-    env = gym.make(env_id, render_mode='rgb_array')
+def make_env(cfg: Config, eval_env: bool = False) -> gym.Env:
+    if eval_env:
+        env = gym.make(cfg.env_id, render_mode='rgb_array', frameskip=cfg.frame_skip)
+    else:
+        env = gym.make(cfg.env_id, frameskip=cfg.frame_skip)
     env = gym.wrappers.ResizeObservation(env, (64, 64))
     env = ImageToPyTorch(env)
     return env
@@ -56,14 +44,20 @@ def log_episode_video(
         cfg: Config,
         summary_writer: SummaryWriter,
         env: gym.Env,
-        world_model: "WorldModel",
-        actor: "Actor",
+        world_model: WorldModel,
+        actor: Actor,
         global_step: int,
 ) -> None:
     """
     Roll out a short evaluation episode using the current world model + actor,
     record RGB frames, and write a video to TensorBoard.
     """
+    # store if the models are in training mode
+    was_training_wm = world_model.training
+    was_training_actor = actor.training
+    world_model.eval()
+    actor.eval()
+
     video_frames = []
     done = False
     total_reward = 0.0
@@ -82,14 +76,12 @@ def log_episode_video(
         obs_tensor = torch.tensor(current_obs, dtype=torch.float32, device=cfg.device).unsqueeze(0)
         embed = world_model.encoder(obs_tensor)
         belief = model_state['deter']
-        prior_mean, prior_std, stoch_prior, belief = world_model.rssm.prior(
-            model_state["stoch"], belief, last_action
-        )
-        post_mean, post_std, stoch_post = world_model.rssm.posterior(belief, embed)
+        _, _, stoch_prior, belief = world_model.rssm.prior(model_state["stoch"], belief, last_action)
+        _, _, stoch_post = world_model.rssm.posterior(belief, embed)
         model_state = {"deter": belief, "stoch": stoch_post}
         feat = world_model.get_feat(model_state)
         dist = actor(feat)
-        action_idx = dist.sample().item()
+        action_idx = dist.probs.argmax(dim=-1).item()
 
         # Step the environment
         next_obs, reward, terminated, truncated, _ = env.step(action_idx)
@@ -124,3 +116,9 @@ def log_episode_video(
     )
 
     print(f"Logged episode video ({steps} steps, total reward: {total_reward}) at step {global_step}")
+
+    # Restore model training states
+    if was_training_wm:
+        world_model.train()
+    if was_training_actor:
+        actor.train()

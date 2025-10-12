@@ -14,8 +14,8 @@ from lib.world_model import WorldModel
 
 
 def train(cfg: Config, summary_writer=None):
-    env = make_env(cfg.env_id)
-    eval_env = make_env(cfg.env_id)
+    env = make_env(cfg)
+    eval_env = make_env(cfg, eval_env=True)
 
     obs_space = env.observation_space
     act_space = env.action_space
@@ -36,11 +36,12 @@ def train(cfg: Config, summary_writer=None):
 
     actor = Actor(
         feat_size, act_size, entropy_scale=cfg.entropy_scale,
-        units=cfg.mlp_units, depth=cfg.mlp_depth
+        units=cfg.mlp_units, depth=cfg.mlp_depth, unimix_eps=cfg.unimix_eps,
+        ret_decay=cfg.ret_norm_decay, ret_min_scale=cfg.ret_norm_min_scale,
     ).to(cfg.device)
 
     critic = Critic(
-        feat_size, num_bins=cfg.num_bins, ema_decay=cfg.ema_decay,
+        feat_size, num_bins=cfg.num_bins, ema_decay=cfg.ema_decay, ema_reg=cfg.ema_reg,
         units=cfg.mlp_units, depth=cfg.mlp_depth
     ).to(cfg.device)
 
@@ -87,8 +88,12 @@ def train(cfg: Config, summary_writer=None):
             dist = actor(feat)
             action_idx = dist.sample().item()
 
+            # random steps for initial exploration
+            if env_steps < cfg.warmup_steps:
+                action_idx = env.action_space.sample()
+
             # log real-env policy stats
-            if summary_writer is not None and it % cfg.log_interval == 0:
+            if summary_writer is not None and it % cfg.log_interval == 0 and env_steps >= cfg.warmup_steps:
                 ent_env = dist.entropy().mean().item()
                 summary_writer.add_scalar("policy/env_entropy", ent_env, it)
                 summary_writer.add_histogram("policy/env_probs", dist.probs, it)
@@ -112,15 +117,13 @@ def train(cfg: Config, summary_writer=None):
             last_action = torch.zeros(1, act_size, device=cfg.device)
 
         if len(buffer) > max(cfg.batch_size, cfg.seq_len) and env_steps >= cfg.warmup_steps:
-            # Grant credit for the new policy step
-            credit += cfg.train_ratio / cfg.action_repeat
-            credit = min(credit, cfg.max_credit)
-
-            # Decide how many steps to run now
-            steps_to_do = min(int(credit), cfg.max_steps_per_iter)
+            # Get credit for this env step
+            minibatches_per_env_step = cfg.replay_ratio / (cfg.batch_size * cfg.seq_len * cfg.frame_skip)
+            credit = min(cfg.max_credit, credit + minibatches_per_env_step)
 
             # --- train the world model ---
-            for grad_step in range(steps_to_do):
+            steps_done = 0
+            while credit >= 1.0 and steps_done < cfg.max_steps_per_iter:
                 batch = buffer.sample(cfg.batch_size)
                 obs = batch["observations"]
                 actions = batch["actions"]
@@ -137,19 +140,15 @@ def train(cfg: Config, summary_writer=None):
                 optim_model.step()
 
                 # --- actor-critic in imagination ---
-                batch = buffer.sample(cfg.batch_size)
-                obs = batch["observations"]
-                actions = batch["actions"]
-
-                state0 = world_model.init_state(cfg.batch_size, cfg.device)
-                embeds = world_model.encoder(obs)
-                post, _ = world_model.rssm.observe(embeds, actions, state0)
-                last_state = {
-                    "deter": torch.stack([s["deter"] for s in post], dim=1)[:, -1],
-                    "stoch": torch.stack([s["stoch"] for s in post], dim=1)[:, -1],
-                }
-
                 with torch.no_grad():
+                    state0 = world_model.init_state(cfg.batch_size, cfg.device)
+                    embeds = world_model.encoder(obs)
+                    post, _ = world_model.rssm.observe(embeds, actions, state0)
+                    last_state = {
+                        "deter": torch.stack([s["deter"] for s in post], dim=1)[:, -1],
+                        "stoch": torch.stack([s["stoch"] for s in post], dim=1)[:, -1],
+                    }
+
                     # roll out imagination
                     state = {"deter": last_state["deter"].clone(), "stoch": last_state["stoch"].clone()}
                     feats_list, actions_list = [], []
@@ -173,29 +172,35 @@ def train(cfg: Config, summary_writer=None):
                     flat = imag_feats.view(B * H, F)
                     deter_flat, stoch_flat = flat[:, :cfg.deter_size], flat[:, cfg.deter_size:]
 
-                    rewards_pred = world_model.reward_predictor(deter_flat, stoch_flat).view(B, H)
+                    rewards_pred = world_model.reward_predictor.value(deter_flat, stoch_flat).view(B, H)
                     continues_pred = torch.sigmoid(
                         world_model.continue_predictor(deter_flat, stoch_flat)).view(B, H)
 
-                    values_targ = critic.value(flat, use_target=True).view(B, H)
-                    bootstrap_targ = critic.value(world_model.get_feat(state), use_target=True)
+                    # online values for targets and bootstrap
+                    values = critic.value(flat).view(B, H)
+                    bootstrap = critic.value(world_model.get_feat(state))
 
                     # compute lambda-returns
-                    lambda_returns = torch.zeros_like(values_targ)
-                    values_all = torch.cat([values_targ, bootstrap_targ.unsqueeze(1)], dim=1)
-                    next_return = bootstrap_targ
+                    lambda_returns = torch.zeros_like(values)
+                    values_all = torch.cat([values, bootstrap.unsqueeze(1)], dim=1)
+                    # values_all: [B, H+1], rewards_pred, continues_pred: [B, H]
+                    ret = bootstrap
                     for i in reversed(range(H)):
-                        discount = cfg.gamma * continues_pred[:, i].clamp(0.8, 1.0)
-                        td = rewards_pred[:, i] + discount * values_all[:, i + 1] - values_all[:, i]
-                        next_return = values_all[:, i] + cfg.lam * td + (1 - cfg.lam) * discount * next_return
-                        lambda_returns[:, i] = next_return
+                        discount = (cfg.gamma * continues_pred[:, i]).clamp_max(1.0)
+                        ret = rewards_pred[:, i] + discount * ((1 - cfg.lam) * values_all[:, i + 1] + cfg.lam * ret)
+                        lambda_returns[:, i] = ret
+                    advantages = lambda_returns - values
 
-                imag_feats_det = imag_feats.detach()
-                values_online = critic.value(flat, use_target=False).view(B, H).detach()
-                advantages = (lambda_returns - values_online)
+                # detach imagined features so no gradients through world model
+                detached_imag_feats = imag_feats.detach()
+                detached_lamda_returns = lambda_returns.detach()
+                detached_values = values.detach()
+                detached_advantages = advantages.detach()
+                detached_rewards_pred = rewards_pred.detach()
+                detached_continues_pred = continues_pred.detach()
 
                 # ---- Critic update ----
-                critic_loss = critic.loss(imag_feats_det, lambda_returns.detach())
+                critic_loss = critic.loss(detached_imag_feats, detached_lamda_returns)
                 optim_critic.zero_grad(set_to_none=True)
                 critic_loss.backward()
                 nn.utils.clip_grad_norm_(critic.parameters(), 100.0)
@@ -203,38 +208,38 @@ def train(cfg: Config, summary_writer=None):
                 critic.update_target()
 
                 # ---- Actor update ----
-                actor_loss = actor.loss(imag_feats_det, imag_actions, lambda_returns.detach(), values_online)
+                actor_loss = actor.loss(detached_imag_feats, imag_actions, detached_lamda_returns, detached_values)
                 optim_actor.zero_grad(set_to_none=True)
                 actor_loss.backward()
                 nn.utils.clip_grad_norm_(actor.parameters(), 100.0)
                 optim_actor.step()
 
-                # Pay back the owed credit
-                credit -= 1.0
-
                 # ---- Rich logging ----
-                if summary_writer is not None and it % cfg.log_interval == 0 and grad_step == steps_to_do - 1:
+                if summary_writer is not None and steps_done == 0:
                     with torch.no_grad():
-                        dist_im = actor(imag_feats_det.view(-1, imag_feats_det.size(-1)))
+                        dist_im = actor(detached_imag_feats.view(-1, detached_imag_feats.size(-1)))
                         ent_im = dist_im.entropy().mean().item()
-                        adv_vec = advantages.view(-1)
-                        vals_vec = values_online.view(-1)
-                        rew_vec = rewards_pred.view(-1)
-                        cont_vec = continues_pred.view(-1)
+                        adv_vec = detached_advantages.view(-1)
+                        vals_vec = detached_values.view(-1)
+                        rew_vec = detached_rewards_pred.view(-1)
+                        cont_vec = detached_continues_pred.view(-1)
 
                     summary_writer.add_scalar("policy/imag_entropy", ent_im, it)
                     summary_writer.add_histogram("policy/imag_probs", dist_im.probs, it)
-                    summary_writer.add_scalar("value/online_mean", vals_vec.mean().item(), it)
-                    summary_writer.add_scalar(
-                        "value/online_std", vals_vec.std(unbiased=False).item(), it)
+                    summary_writer.add_scalar("value/mean", vals_vec.mean().item(), it)
+                    summary_writer.add_scalar("value/std", vals_vec.std(unbiased=False).item(), it)
                     summary_writer.add_scalar("returns/lambda_mean", lambda_returns.mean().item(), it)
-                    summary_writer.add_scalar(
-                        "returns/lambda_std", lambda_returns.std(unbiased=False).item(), it)
+                    summary_writer.add_scalar("returns/lambda_std", lambda_returns.std(unbiased=False).item(), it)
                     summary_writer.add_scalar("adv/mean", adv_vec.mean().item(), it)
                     summary_writer.add_scalar("adv/std", adv_vec.std(unbiased=False).item(), it)
                     summary_writer.add_scalar("reward_pred/mean", rew_vec.mean().item(), it)
                     summary_writer.add_scalar("reward_pred/std", rew_vec.std(unbiased=False).item(), it)
                     summary_writer.add_scalar("continue_pred/mean", cont_vec.mean().item(), it)
+
+                # Pay back the owed credit
+                credit -= 1.0
+                credit = max(0.0, credit)
+                steps_done += 1
 
         # ---- Console + scalar logs ----
         if it % cfg.log_interval == 0 and it > 0 and loss is not None:
