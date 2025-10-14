@@ -10,47 +10,43 @@ class Config:
     # --- Environment and device settings ---
     env_id: str = "ALE/Breakout-v5"
     device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    frame_skip: int = 4
 
-    # --- Training parameters ---
-    num_iterations: int = 10_000_000
-    replay_ratio: float = 32.0
-    warmup_steps: int = 10_000
-    max_credit: int = 2048
-    max_steps_per_iter: int = 64
+    # --- Hyperparameters ---
+    # General
+    num_iterations: int = 1e7
+    replay_capacity: int = 1e6
     batch_size: int = 16
+    batch_length: int = 64
 
-    # optimizer
-    world_model_lr: float = 4e-5
-    actor_lr: float = 4e-5
-    critic_lr: float = 4e-5
-
-    # buffer sizes
-    buffer_capacity: int = 1_000_000
-    seq_len: int = 64
-
-    # dreamer specific
-    free_nats: float = 1.0
+    # World Model
+    num_latents = 32
+    classes_per_latent = 32
     beta_pred: float = 1.0
-    beta_dyn: float = 1.0
+    beta_dyn: float = 0.5
     beta_rep: float = 0.1
-    imagination_horizon: int = 15
-    gamma: float = 0.997
-    lam: float = 0.95
+    world_model_lr: float = 3e-4
+    world_model_adam_eps: float = 1e-8
+    world_model_grad_clip: float = 1000.0
 
-    # network architecture
-    embed_size: int = 1024
-    deter_size: int = 512
-    stoch_size: int = 32
-    mlp_units: int = 512
-    mlp_depth: int = 4
-    entropy_scale: float = 3e-4
-    unimix_eps: float = 0.01
-    ret_norm_decay: float = 0.99
-    ret_norm_min_scale: float = 1.0
-    num_bins: int = 255
-    ema_decay: float = 0.98
-    ema_reg: float = 1.0
+    # Actor Critic
+    imagination_horizon: int = 15
+    discount_horizon: int = 333
+    lam: float = 0.95
+    critic_ema_decay: float = 0.98
+    critic_ema_regularizer: float = 1.0
+    return_normalization_scale: float = (0.95, 0.05)
+    return_normalization_limit: float = 1.0
+    return_normalization_decay: float = 0.99
+    actor_entropy_scale: float = 3e-4
+    actor_critic_lr: float = 3e-5
+    actor_critic_adam_eps: float = 1e-5
+    actor_critic_grad_clip: float = 100.0
+
+    # Network sizes
+    gru_recurrent_units: int = 512
+    cnn_multiplier: int = 32
+    dense_hidden_units: int = 512
+    mlp_layers: int = 2
 
     # --- Logging and checkpointing ---
     create_artifacts: bool = True

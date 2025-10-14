@@ -29,21 +29,16 @@ def train(cfg: Config, summary_writer=None):
 
     # --- Models ---
     world_model = WorldModel(
-        obs_shape, act_size, cfg.embed_size, cfg.deter_size, cfg.stoch_size,
-        cfg.free_nats, cfg.beta_pred, cfg.beta_dyn, cfg.beta_rep,
-        units=cfg.mlp_units, depth=cfg.mlp_depth
+        # TODO: add signature
     ).to(cfg.device)
     feat_size = cfg.deter_size + cfg.stoch_size
 
     actor = Actor(
-        feat_size, act_size, entropy_scale=cfg.entropy_scale,
-        units=cfg.mlp_units, depth=cfg.mlp_depth, unimix_eps=cfg.unimix_eps,
-        ret_decay=cfg.ret_norm_decay, ret_min_scale=cfg.ret_norm_min_scale,
+        # TODO: add signature
     ).to(cfg.device)
 
     critic = Critic(
-        feat_size, num_bins=cfg.num_bins, ema_decay=cfg.ema_decay, ema_reg=cfg.ema_reg,
-        units=cfg.mlp_units, depth=cfg.mlp_depth
+        # TODO: add signature
     ).to(cfg.device)
 
     # print model sizes
@@ -55,7 +50,7 @@ def train(cfg: Config, summary_writer=None):
     print(f"Critic parameters: {count_params(critic):,}")
 
     # --- Replay Buffer ---
-    buffer = ReplayBuffer(cfg.buffer_capacity, obs_shape, act_size, cfg.seq_len, cfg.device)
+    buffer = ReplayBuffer(cfg.replay_capacity, obs_shape, act_size, cfg.batch_length, cfg.device)
 
     # --- Optimizers ---
     optim_model = torch.optim.Adam(world_model.parameters(), lr=cfg.world_model_lr)
@@ -125,9 +120,9 @@ def train(cfg: Config, summary_writer=None):
             model_state = world_model.init_state(1, cfg.device)
             last_action = torch.zeros(1, act_size, device=cfg.device)
 
-        if len(buffer) > max(cfg.batch_size, cfg.seq_len) and env_steps >= cfg.warmup_steps:
+        if len(buffer) > max(cfg.batch_size, cfg.batch_length) and env_steps >= cfg.warmup_steps:
             # Get credit for this env step
-            minibatches_per_env_step = cfg.replay_ratio / (cfg.batch_size * cfg.seq_len * cfg.frame_skip)
+            minibatches_per_env_step = cfg.replay_ratio / (cfg.batch_size * cfg.batch_length)
             credit = min(cfg.max_credit, credit + minibatches_per_env_step)
 
             # --- train the world model ---
@@ -214,7 +209,6 @@ def train(cfg: Config, summary_writer=None):
                 critic_loss.backward()
                 nn.utils.clip_grad_norm_(critic.parameters(), 100.0)
                 optim_critic.step()
-                critic.update_target()
 
                 # ---- Actor update ----
                 actor_loss = actor.loss(detached_imag_feats, imag_actions, detached_lamda_returns, detached_values)

@@ -1,5 +1,5 @@
 import torch.nn as nn
 
 
-class Actor(nn.Module):
+class MultiLayerPerceptron(nn.Module):
     raise NotImplementedError
