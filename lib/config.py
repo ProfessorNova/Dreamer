@@ -21,6 +21,7 @@ class Config:
     # World Model
     num_latents = 32
     classes_per_latent = 32
+    free_bits: float = 1.0
     beta_pred: float = 1.0
     beta_dyn: float = 0.5
     beta_rep: float = 0.1
@@ -30,7 +31,8 @@ class Config:
 
     # Actor Critic
     imagination_horizon: int = 15
-    discount_horizon: int = 333
+    gamma: float = 0.997
+    discount_horizon: int = int(1 / (1 - gamma))
     lam: float = 0.95
     critic_ema_decay: float = 0.98
     critic_ema_regularizer: float = 1.0

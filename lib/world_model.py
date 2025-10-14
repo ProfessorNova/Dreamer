@@ -1,7 +1,18 @@
-from typing import Tuple
+from dataclasses import dataclass
+from typing import Tuple, Optional, Dict, Any
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+from torch import Tensor
+
+from lib.utils import symlog
+
+
+@dataclass
+class WorldModelState:
+    h: torch.Tensor  # (B, h_dim)
+    z: torch.Tensor  # (B, num_latents, classes_per_latent)
 
 
 class SequenceModel(nn.Module):
@@ -13,36 +24,37 @@ class SequenceModel(nn.Module):
 
     def __init__(
             self,
-            action_dim: int,
+            num_actions: int,
             h_dim: int = 512,
             num_latents: int = 32,
             classes_per_latent: int = 32,
-            dense_hidden_units: int = 512,
+            hidden: int = 512,
     ):
         super().__init__()
+        self.num_actions = num_actions
+        in_dim = h_dim + num_latents * classes_per_latent + num_actions
         self.input_layer = nn.Sequential(
-            nn.LayerNorm(h_dim + num_latents * classes_per_latent + action_dim),
-            nn.Linear(h_dim + num_latents * classes_per_latent + action_dim, dense_hidden_units),
-            nn.SiLU(inplace=True),
+            nn.LayerNorm(in_dim),
+            nn.Linear(in_dim, hidden),
+            nn.SiLU(),
         )
-        self.rnn = nn.GRUCell(dense_hidden_units, h_dim)
+        self.rnn = nn.GRUCell(hidden, h_dim)
 
-    def forward(self, h_prev: torch.Tensor, z_prev: torch.Tensor, a_prev: torch.Tensor) -> torch.Tensor:
+    def forward(self, h_prev: torch.Tensor, z_prev: torch.Tensor, a_prev_idx: torch.Tensor) -> torch.Tensor:
         """
         Args:
             h_prev: (B, h_dim)
             z_prev: (B, num_latents, classes_per_latent)
-            a_prev: (B, action_dim)
+            a_prev_idx: (B,) with values in [0, num_actions-1]
 
         Returns:
             h_t: (B, h_dim)
         """
-        B = h_prev.size(0)
-        z_prev_flat = z_prev.view(B, -1)
-        rnn_input = torch.cat([h_prev, z_prev_flat, a_prev], dim=-1)
-        input_layer_out = self.input_layer(rnn_input)
-        h_t = self.rnn(input_layer_out, h_prev)
-        return h_t
+        a_onehot = F.one_hot(a_prev_idx, num_classes=self.num_actions).float()
+        z_flat = z_prev.reshape(z_prev.size(0), -1)
+        x = torch.cat([h_prev, z_flat, a_onehot], dim=-1)
+        x = self.input_layer(x)
+        return self.rnn(x, h_prev)
 
 
 class Encoder(nn.Module):
@@ -60,20 +72,20 @@ class Encoder(nn.Module):
             classes_per_latent: int = 32,
             h_dim: int = 512,
             cnn_multiplier: int = 32,
-            dense_hidden_units: int = 512,
+            hidden: int = 512,
     ):
         super().__init__()
         C, H, W = obs_shape
         # 64x64 -> 32x32 -> 16x16 -> 8x8 -> 4x4
         self.conv = nn.Sequential(
             nn.Conv2d(C, cnn_multiplier, 3, stride=2, padding=1),
-            nn.SiLU(inplace=True),
+            nn.SiLU(),
             nn.Conv2d(cnn_multiplier, cnn_multiplier * 2, 3, stride=2, padding=1),
-            nn.SiLU(inplace=True),
+            nn.SiLU(),
             nn.Conv2d(cnn_multiplier * 2, cnn_multiplier * 4, 3, stride=2, padding=1),
-            nn.SiLU(inplace=True),
+            nn.SiLU(),
             nn.Conv2d(cnn_multiplier * 4, cnn_multiplier * 8, 3, stride=2, padding=1),
-            nn.SiLU(inplace=True),
+            nn.SiLU(),
             nn.Flatten(),
         )
 
@@ -81,9 +93,9 @@ class Encoder(nn.Module):
 
         self.fc = nn.Sequential(
             nn.LayerNorm(conv_out_size + h_dim),
-            nn.Linear(conv_out_size + h_dim, dense_hidden_units),
-            nn.SiLU(inplace=True),
-            nn.Linear(dense_hidden_units, num_latents * classes_per_latent),
+            nn.Linear(conv_out_size + h_dim, hidden),
+            nn.SiLU(),
+            nn.Linear(hidden, num_latents * classes_per_latent),
         )
         self.num_latents, self.classes_per_latent = num_latents, classes_per_latent
 
@@ -101,6 +113,8 @@ class Encoder(nn.Module):
         Returns:
             logits over classes per latent: (B, num_latents, classes_per_latent)
         """
+        B = x_t.size(0)
+        assert x_t.dim() == 4 and x_t.shape == (B, 3, 64, 64)
         conv_out = self.conv(x_t)  # (B, conv_out)
         combined = torch.cat([conv_out, h_t], dim=-1)  # (B, conv_out + h_dim)
         logits = self.fc(combined).view(-1, self.num_latents, self.classes_per_latent)
@@ -119,7 +133,7 @@ class DynamicsPredictor(nn.Module):
             h_dim: int = 512,
             num_latents: int = 32,
             classes_per_latent: int = 32,
-            dense_hidden_units: int = 512,
+            hidden: int = 512,
             depth: int = 2,
     ):
         super().__init__()
@@ -127,11 +141,11 @@ class DynamicsPredictor(nn.Module):
         dim = h_dim
         for _ in range(depth):
             layers.append(nn.LayerNorm(dim))
-            layers.append(nn.Linear(dim, dense_hidden_units))
-            layers.append(nn.SiLU(inplace=True))
-            dim = dense_hidden_units
+            layers.append(nn.Linear(dim, hidden))
+            layers.append(nn.SiLU())
+            dim = hidden
         self.mlp = nn.Sequential(*layers)
-        self.head = nn.Linear(dense_hidden_units, num_latents * classes_per_latent)
+        self.head = nn.Linear(hidden, num_latents * classes_per_latent)
         self.num_latents, self.classes_per_latent = num_latents, classes_per_latent
 
     def forward(self, h_t: torch.Tensor) -> torch.Tensor:
@@ -147,13 +161,6 @@ class DynamicsPredictor(nn.Module):
         return logits
 
 
-class WorldModel(nn.Module):
-    """
-    The World Model is a RSSM that consists of a sequence model, an encoder, and a dynamics predictor.
-    """
-    raise NotImplementedError
-
-
 class RewardPredictor(nn.Module):
     """
     Predictor that predicts reward r_t with the concatenation of h_t and z_t.
@@ -164,7 +171,7 @@ class RewardPredictor(nn.Module):
             h_dim: int = 512,
             num_latents: int = 32,
             classes_per_latent: int = 32,
-            dense_hidden_units: int = 512,
+            hidden: int = 512,
             depth: int = 2,
     ):
         super().__init__()
@@ -172,11 +179,11 @@ class RewardPredictor(nn.Module):
         dim = h_dim + num_latents * classes_per_latent
         for _ in range(depth):
             layers.append(nn.LayerNorm(dim))
-            layers.append(nn.Linear(dim, dense_hidden_units))
-            layers.append(nn.SiLU(inplace=True))
-            dim = dense_hidden_units
+            layers.append(nn.Linear(dim, hidden))
+            layers.append(nn.SiLU())
+            dim = hidden
         self.mlp = nn.Sequential(*layers)
-        self.head = nn.Linear(dense_hidden_units, 1)
+        self.head = nn.Linear(hidden, 1)
         self.num_latents, self.classes_per_latent = num_latents, classes_per_latent
 
     def forward(self, h_t: torch.Tensor, z_t: torch.Tensor) -> torch.Tensor:
@@ -207,7 +214,7 @@ class ContinuePredictor(nn.Module):
             h_dim: int = 512,
             num_latents: int = 32,
             classes_per_latent: int = 32,
-            dense_hidden_units: int = 512,
+            hidden: int = 512,
             depth: int = 2,
     ):
         super().__init__()
@@ -215,11 +222,11 @@ class ContinuePredictor(nn.Module):
         dim = h_dim + num_latents * classes_per_latent
         for _ in range(depth):
             layers.append(nn.LayerNorm(dim))
-            layers.append(nn.Linear(dim, dense_hidden_units))
-            layers.append(nn.SiLU(inplace=True))
-            dim = dense_hidden_units
+            layers.append(nn.Linear(dim, hidden))
+            layers.append(nn.SiLU())
+            dim = hidden
         self.mlp = nn.Sequential(*layers)
-        self.head = nn.Linear(dense_hidden_units, 1)
+        self.head = nn.Linear(hidden, 1)
         self.num_latents, self.classes_per_latent = num_latents, classes_per_latent
 
     def forward(self, h_t: torch.Tensor, z_t: torch.Tensor) -> torch.Tensor:
@@ -252,26 +259,26 @@ class Decoder(nn.Module):
             classes_per_latent: int = 32,
             h_dim: int = 512,
             cnn_multiplier: int = 32,
-            dense_hidden_units: int = 512,
+            hidden: int = 512,
     ):
         super().__init__()
         C, H, W = obs_shape
 
         self.fc = nn.Sequential(
             nn.LayerNorm(h_dim + num_latents * classes_per_latent),
-            nn.Linear(h_dim + num_latents * classes_per_latent, dense_hidden_units),
-            nn.SiLU(inplace=True),
-            nn.Linear(dense_hidden_units, cnn_multiplier * 8 * 4 * 4),
-            nn.SiLU(inplace=True),
+            nn.Linear(h_dim + num_latents * classes_per_latent, hidden),
+            nn.SiLU(),
+            nn.Linear(hidden, cnn_multiplier * 8 * 4 * 4),
+            nn.SiLU(),
         )
 
         self.deconv = nn.Sequential(
             nn.ConvTranspose2d(cnn_multiplier * 8, cnn_multiplier * 4, 3, stride=2, padding=1, output_padding=1),
-            nn.SiLU(inplace=True),
+            nn.SiLU(),
             nn.ConvTranspose2d(cnn_multiplier * 4, cnn_multiplier * 2, 3, stride=2, padding=1, output_padding=1),
-            nn.SiLU(inplace=True),
+            nn.SiLU(),
             nn.ConvTranspose2d(cnn_multiplier * 2, cnn_multiplier, 3, stride=2, padding=1, output_padding=1),
-            nn.SiLU(inplace=True),
+            nn.SiLU(),
             nn.ConvTranspose2d(cnn_multiplier, C, 3, stride=2, padding=1, output_padding=1),
         )
 
@@ -290,4 +297,289 @@ class Decoder(nn.Module):
         fc_out = self.fc(combined)  # (B, cnn_multiplier * 8 * 4 * 4)
         deconv_input = fc_out.view(B, -1, 4, 4)  # (B, cnn_multiplier * 8, 4, 4)
         x_recon = self.deconv(deconv_input)  # (B, C, H, W)
+        assert x_recon.dim() == 4 and x_recon.shape == (B, 3, 64, 64)
         return x_recon
+
+
+class WorldModel(nn.Module):
+    """
+    The World Model is a RSSM that combines the above components.
+    """
+
+    def __init__(
+            self,
+            obs_shape: Tuple[int, ...],
+            num_actions: int,
+            h_dim: int = 512,
+            num_latents: int = 32,
+            classes_per_latent: int = 32,
+            cnn_multiplier: int = 32,
+            hidden: int = 512,
+            depth: int = 2,
+            free_bits: float = 1.0,
+            beta_pred: float = 1.0,
+            beta_dyn: float = 0.5,
+            beta_rep: float = 0.1,
+    ):
+        super().__init__()
+        self.obs_shape = obs_shape
+        self.num_actions = num_actions
+        self.h_dim = h_dim
+        self.num_latents = num_latents
+        self.classes_per_latent = classes_per_latent
+        self.free_bits = free_bits
+        self.beta_pred = beta_pred
+        self.beta_dyn = beta_dyn
+        self.beta_rep = beta_rep
+
+        self.seq = SequenceModel(
+            num_actions=num_actions,
+            h_dim=h_dim,
+            num_latents=num_latents,
+            classes_per_latent=classes_per_latent,
+            hidden=hidden,
+        )
+        self.enc = Encoder(
+            obs_shape=obs_shape,
+            num_latents=num_latents,
+            classes_per_latent=classes_per_latent,
+            h_dim=h_dim,
+            cnn_multiplier=cnn_multiplier,
+            hidden=hidden,
+        )
+        self.dyn = DynamicsPredictor(
+            h_dim=h_dim,
+            num_latents=num_latents,
+            classes_per_latent=classes_per_latent,
+            hidden=hidden,
+            depth=depth,
+        )
+        self.rew = RewardPredictor(
+            h_dim=h_dim,
+            num_latents=num_latents,
+            classes_per_latent=classes_per_latent,
+            hidden=hidden,
+            depth=depth,
+        )
+        self.cont = ContinuePredictor(
+            h_dim=h_dim,
+            num_latents=num_latents,
+            classes_per_latent=classes_per_latent,
+            hidden=hidden,
+            depth=depth,
+        )
+        self.dec = Decoder(
+            obs_shape=obs_shape,
+            num_latents=num_latents,
+            classes_per_latent=classes_per_latent,
+            h_dim=h_dim,
+            cnn_multiplier=cnn_multiplier,
+            hidden=hidden,
+        )
+
+        # zero-init reward and continue predictors to avoid large early prediction errors
+        nn.init.zeros_(self.rew.head.weight)
+        nn.init.zeros_(self.rew.head.bias)
+        nn.init.zeros_(self.cont.head.weight)
+        nn.init.zeros_(self.cont.head.bias)
+
+    @torch.no_grad()
+    def init_state(self, batch_size: int, device=None, dtype=None) -> WorldModelState:
+        h0 = torch.zeros(batch_size, self.h_dim, device=device, dtype=dtype)
+        z0 = torch.full(
+            (batch_size, self.num_latents, self.classes_per_latent),
+            1.0 / self.classes_per_latent,
+            device=device,
+            dtype=dtype if dtype is not None else torch.float32,
+        )
+        return WorldModelState(h=h0, z=z0)
+
+    @staticmethod
+    def _sample_z(logits: torch.Tensor) -> torch.Tensor:
+        # Straight-through Gumbel-Softmax per latent category
+        return F.gumbel_softmax(logits, tau=1.0, hard=True, dim=-1)
+
+    def step(
+            self,
+            state_prev: WorldModelState,
+            a_prev_idx: torch.Tensor,  # (B,)
+            x_t: Optional[torch.Tensor] = None,  # (B,C,H,W) or None for imagination
+    ) -> Tuple[WorldModelState, Dict[str, Any]]:
+        """
+        One RSSM step.
+        If x_t is provided -> posterior; else -> prior (imagination).
+        Returns new state and a dict with heads + logits for losses.
+        """
+        h_prev, z_prev = state_prev.h, state_prev.z
+
+        # The sequence model updates the recurrent state h_t
+        h = self.seq(h_prev, z_prev, a_prev_idx)  # (B, h_dim)
+
+        # The encoder maps sensory input x_t to posterior logits
+        z_logits_post = self.enc(x_t, h) if x_t is not None else None  # (B, L, K) or None
+
+        # The dynamics predictor predicts prior logits from h_t
+        z_logits_prior = self.dyn(h)  # (B, L, K)
+
+        # The logits for z_t are from the encoder if available, else from the dynamics predictor
+        z_logits = z_logits_post if z_logits_post is not None else z_logits_prior  # (B, L, K)
+
+        # Sample z_t (straight-through)
+        z = self._sample_z(z_logits)  # (B, L, K)
+
+        # Heads (reconstruction, reward, continue)
+        x_hat = self.dec(h, z)  # (B,C,H,W)
+        r_hat = self.rew(h, z)  # (B,1)
+        c_hat = self.cont(h, z)  # (B,1)
+
+        new_state = WorldModelState(h=h, z=z)
+        info: Dict[str, Any] = {
+            "prior_logits": z_logits_prior,
+            "post_logits": z_logits_post,  # None in imagination
+            "x_hat": x_hat,  # (B,C,H,W) in symlog space
+            "r_hat": r_hat,  # (B,1) in symlog space
+            "c_hat": c_hat,
+        }
+        return new_state, info
+
+    @staticmethod
+    def _mse_symlog(pred: torch.Tensor, target: torch.Tensor, reduce_over: Tuple[int, ...]) -> torch.Tensor:
+        """
+        Mean squared error in symlog space.
+        """
+        se = (pred - symlog(target)) ** 2
+        return 0.5 * se.mean(dim=reduce_over)
+
+    @staticmethod
+    def _kl_categorical_logits(q_logits: torch.Tensor, p_logits: torch.Tensor) -> torch.Tensor:
+        """
+        KL[ q || p ] for factorized categoricals over (L,K), summed over K and L -> (B,)
+        """
+        log_q = F.log_softmax(q_logits, dim=-1)  # (B,L,K)
+        log_p = F.log_softmax(p_logits, dim=-1)  # (B,L,K)
+        q = log_q.exp()
+        kl = (q * (log_q - log_p)).sum(dim=-1)  # sum over K -> (B,L)
+        kl = kl.sum(dim=-1)  # sum over L -> (B,)
+        return kl
+
+    def _prediction_loss(
+            self,
+            x_true: torch.Tensor,
+            x_hat: torch.Tensor,
+            r_true: torch.Tensor,
+            r_hat: torch.Tensor,
+            c_true: torch.Tensor,
+            c_hat: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        The prediction loss trains the decoder and reward predictor via the symlog loss
+        and the continue predictor via binary classification loss.
+        """
+        img_loss = self._mse_symlog(x_hat, x_true, reduce_over=(1, 2, 3))
+        rew_loss = self._mse_symlog(r_hat, r_true, reduce_over=(-1,))
+        cont_loss = F.binary_cross_entropy_with_logits(c_hat, c_true, reduction="none").squeeze(-1)
+
+        return img_loss + rew_loss + cont_loss
+
+    def _dynamics_loss(
+            self,
+            post_logits: torch.Tensor,
+            prior_logits: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        The dynamics loss trains the sequence model to predict the next representation
+        by minimizing the KL divergence between the predictor and the next stochastic representation.
+        """
+        post_logits = post_logits.detach()  # stop gradient to the encoder
+
+        kl = self._kl_categorical_logits(post_logits, prior_logits)
+        kl = torch.clamp(kl, min=self.free_bits)  # free bits
+        return kl
+
+    def _representation_loss(
+            self,
+            post_logits: torch.Tensor,
+            prior_logits: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        The representation loss trains the representations to become more predictable if the dynamics
+        cannot predict their distribution, allowing us to use a factorized dynamics predictor for fast sampling
+        when training the actor and critic.
+        """
+        prior_logits = prior_logits.detach()  # stop gradient to the dynamics predictor
+
+        kl = self._kl_categorical_logits(post_logits, prior_logits)
+        kl = torch.clamp(kl, min=self.free_bits)  # free bits
+        return kl
+
+    def loss(
+            self,
+            obs: torch.Tensor,  # (B,T,C,H,W)
+            actions: torch.Tensor,  # (B,T) action indices
+            rewards: torch.Tensor,  # (B,T,1)
+            continues: torch.Tensor,  # (B,T,1) {0, 1}
+            init_state: Optional[WorldModelState] = None,
+    ) -> tuple[Tensor, dict[str, Tensor]]:
+        """
+        Roll out a subsequence of length T and compute DreamerV3 world-model loss.
+        Returns (total_loss, metrics_dict).
+        """
+        B, T = obs.size(0), obs.size(1)
+        device = obs.device
+
+        # prev actions a_{t-1}: left-shift, inject 0 for t=0
+        a_prev = torch.zeros(B, T, dtype=torch.long, device=device)
+        a_prev[:, 1:] = actions[:, :-1]
+
+        state = init_state if init_state is not None else self.init_state(B, device=device, dtype=obs.dtype)
+
+        pred_losses = []
+        dyn_losses = []
+        rep_losses = []
+
+        for t in range(T):
+            # one RSSM step
+            state, info = self.step(
+                state_prev=state,
+                a_prev_idx=a_prev[:, t],
+                x_t=obs[:, t]
+            )
+
+            # prediction loss
+            pred_loss = self._prediction_loss(
+                x_true=obs[:, t],  # (B,C,H,W)
+                x_hat=info["x_hat"],  # (B,C,H,W)
+                r_true=rewards[:, t].unsqueeze(-1),  # (B,1)
+                r_hat=info["r_hat"],  # (B,1)
+                c_true=continues[:, t].float().unsqueeze(-1),  # (B,1)
+                c_hat=info["c_hat"],  # (B,1)
+            )
+            pred_losses.append(pred_loss)
+
+            # dynamics loss
+            dyn_loss = self._dynamics_loss(
+                post_logits=info["post_logits"],
+                prior_logits=info["prior_logits"],
+            )
+            dyn_losses.append(dyn_loss)
+
+            # representation loss
+            rep_loss = self._representation_loss(
+                post_logits=info["post_logits"],
+                prior_logits=info["prior_logits"],
+            )
+            rep_losses.append(rep_loss)
+
+        # Stack losses over time -> (T,B), then mean over time and batch -> (1,)
+        pred = torch.stack(pred_losses, dim=0).mean()
+        dyn = torch.stack(dyn_losses, dim=0).mean()
+        rep = torch.stack(rep_losses, dim=0).mean()
+
+        total_loss = self.beta_pred * pred + self.beta_dyn * dyn + self.beta_rep * rep
+        metrics = {
+            "total_loss": total_loss,
+            "pred_loss": pred,
+            "dyn_loss": dyn,
+            "rep_loss": rep,
+        }
+        return total_loss, metrics
