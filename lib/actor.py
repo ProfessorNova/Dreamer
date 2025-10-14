@@ -1,66 +1,112 @@
+"""
+Actor network and training for DreamerV3.
+
+The actor is responsible for proposing actions that maximize the expected
+returns when interacting with the imagined world model.  It takes as
+input the latent representation of the current model state and outputs
+a categorical distribution over discrete actions.  The actor is trained
+via the REINFORCE estimator on imagined trajectories using returns
+computed by the critic【145968576409203†L438-L548】.  To encourage exploration, an
+entropy regularizer is applied with a fixed scale, and returns are
+normalized using the 5th and 95th percentiles to adapt the learning
+rate across tasks【145968576409203†L529-L567】.
+"""
+from __future__ import annotations
+
+from typing import Tuple
+
 import torch
 import torch.nn as nn
 
-from lib.nn_blocks import ResidualMLP
 
+class ReturnScaler:
+    """Maintain running range estimates of returns for normalization.
 
-class EMAPercentileScale(nn.Module):
-    def __init__(self, decay: float = 0.99, min_scale: float = 1.0):
-        super().__init__()
-        self.decay = decay
-        self.min_scale = min_scale
-        self.register_buffer("p5", torch.tensor(0.0))
-        self.register_buffer("p95", torch.tensor(1.0))
-        self._init = False
+    DreamerV3 normalizes returns to be roughly in [0, 1] but only scales
+    down large magnitudes while leaving small returns untouched【145968576409203†L529-L567】.
+    This class tracks the 5th and 95th percentiles using an exponential
+    moving average and provides scaling factors for normalization.
+    """
 
-    def update_get_scale(self, x: torch.Tensor) -> torch.Tensor:
-        x = x.detach().reshape(-1).float()
-        if x.numel() == 0:
-            return torch.clamp(self.p95 - self.p5, min=self.min_scale)
-        q05 = torch.quantile(x, 0.05)
-        q95 = torch.quantile(x, 0.95)
-        if not self._init:
-            self.p5.copy_(q05)
-            self.p95.copy_(q95)
-            self._init = True
+    def __init__(self, momentum: float = 0.99):
+        self.momentum = momentum
+        self.range = None
+
+    def update(self, returns: torch.Tensor) -> None:
+        # Compute percentiles along batch and time dimensions
+        p5 = torch.quantile(returns, 0.05).item()
+        p95 = torch.quantile(returns, 0.95).item()
+        current_range = max(p95 - p5, 1e-6)
+        if self.range is None:
+            self.range = current_range
         else:
-            self.p5.mul_(self.decay).add_(q05 * (1.0 - self.decay))
-            self.p95.mul_(self.decay).add_(q95 * (1.0 - self.decay))
-        return torch.clamp(self.p95 - self.p5, min=self.min_scale)
+            self.range = self.momentum * self.range + (1 - self.momentum) * current_range
+
+    def scale(self, returns: torch.Tensor) -> torch.Tensor:
+        if self.range is None:
+            return returns
+        # Only scale returns larger than 1 by dividing by the running range
+        denom = max(1.0, self.range)
+        return returns / denom
 
 
 class Actor(nn.Module):
-    def __init__(self, feat_size, action_size, entropy_scale=1e-3,
-                 units=256, depth=16, unimix_eps=0.01, ret_decay=0.99, ret_min_scale=1.0):
+    """Discrete action actor network."""
+
+    def __init__(self, feat_size: int, action_size: int, hidden_size: int = 400, entropy_scale: float = 3e-4):
         super().__init__()
-        self.action_size = action_size
         self.entropy_scale = entropy_scale
-        self.unimix_eps = unimix_eps
-        self.mlp = ResidualMLP(feat_size, action_size, units, depth)
-        self.ret_norm = EMAPercentileScale(decay=ret_decay, min_scale=ret_min_scale)
+        self.fc = nn.Sequential(
+            nn.Linear(feat_size, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, action_size),
+        )
+        self.return_scaler = ReturnScaler()
 
-    def _dist(self, feat: torch.Tensor) -> torch.distributions.Categorical:
-        logits = self.mlp(feat)
-        probs = logits.softmax(dim=-1)
-        # unimix -> no zero probs; small clamp just for safety
-        k = probs.size(-1)
-        probs = (1 - self.unimix_eps) * probs + self.unimix_eps / k
-        probs = probs.clamp_min(1e-8)
-        return torch.distributions.Categorical(probs=probs)
+    def forward(self, feat: torch.Tensor) -> torch.distributions.Categorical:
+        logits = self.fc(feat)
+        return torch.distributions.Categorical(logits=logits)
 
-    def forward(self, feat):
-        return self._dist(feat)
+    def act(self, feat: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Sample actions and return them along with log probabilities."""
+        dist = self.forward(feat)
+        action = dist.sample()
+        log_prob = dist.log_prob(action)
+        return action, log_prob
 
-    def loss(self, feats, actions, returns, values):
-        B, T, F = feats.shape
-        dist = self._dist(feats.view(B * T, F))
-        log_probs = dist.log_prob(actions.view(-1)).view(B, T)
-        entropies = dist.entropy().view(B, T)
+    def loss(
+            self,
+            feats: torch.Tensor,
+            actions: torch.Tensor,
+            returns: torch.Tensor,
+            values: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute the actor loss for a batch of imagined trajectories.
 
-        adv = returns - values  # [B, T]
-        scale = self.ret_norm.update_get_scale(returns)  # EMA of p95-p5 from lambda-returns
-        adv_norm = (adv / scale).clamp(-5.0, 5.0).detach()
+        Args:
+            feats: Tensor of shape (batch, time, feat_size) representing model
+                features.
+            actions: Tensor of shape (batch, time) with sampled actions.
+            returns: Tensor of shape (batch, time) with λ‑returns (bootstrapped
+                future rewards) computed by the critic.
+            values: Tensor of shape (batch, time) with predicted values from the
+                critic.
 
-        loss_pg = -(adv_norm * log_probs).mean()
-        loss_ent = - self.entropy_scale * entropies.mean()
-        return loss_pg + loss_ent
+        Returns:
+            Scalar actor loss.
+        """
+        batch, time, feat_size = feats.size()
+        dist = self.forward(feats.view(-1, feat_size))
+        log_probs = dist.log_prob(actions.view(-1))
+        log_probs = log_probs.view(batch, time)
+        entropies = dist.entropy().view(batch, time)
+        # Compute advantage as normalized returns minus values
+        adv = returns - values
+        # Update return scaler and normalize advantages
+        self.return_scaler.update(returns.detach())
+        norm_adv = self.return_scaler.scale(adv)
+        # Actor loss: negative log likelihood weighted by advantage and entropy regularizer【145968576409203†L540-L549】
+        loss = - (norm_adv.detach() * log_probs).mean() - self.entropy_scale * entropies.mean()
+        return loss

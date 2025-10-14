@@ -1,485 +1,476 @@
-from typing import Dict, List, Tuple, Any
+"""
+World model implementation for DreamerV3.
+
+The world model is the key component of DreamerV3 that provides rich
+latent representations and enables imagination through self‑supervised
+learning.  DreamerV3 uses a recurrent state‑space model (RSSM) where a
+deterministic recurrent state is combined with a stochastic latent state
+to form a Markovian representation【145968576409203†L293-L344】.  Given an input
+observation and an action, the model encodes the observation into a
+stochastic latent, updates the deterministic hidden state, predicts the
+next latent distribution (prior), and reconstructs the input as well as
+predicting the reward and whether an episode continues【145968576409203†L293-L351】.
+
+This module implements a simplified but faithful version of the world
+model in PyTorch.  It supports both RGB image inputs and low‑dimensional
+vector observations.  The model consists of the following components:
+
+* Encoder: maps raw observations into feature vectors using a small
+  convolutional network for images and an MLP for vectors.
+* RecurrentStateSpaceModel: maintains a deterministic recurrent state and
+  stochastic latent state; provides methods to perform both observation
+  (posterior) and imagination (prior) updates【145968576409203†L293-L351】.
+* Decoder: reconstructs observations from the latent and hidden state.
+* RewardPredictor: predicts the immediate reward from the latent and
+  hidden state.
+* ContinuePredictor: predicts whether an episode continues (1 – done flag).
+
+The world model exposes a forward method for computing losses from
+sequences of observations, actions, rewards, and continuation flags, and
+a method for rolling out imagined trajectories given start states and a
+sequence of actions.  The losses include reconstruction error, KL
+divergence between prior and posterior latents, reward prediction loss,
+and continuation prediction loss, as described in the paper【145968576409203†L293-L365】.
+
+Note: To keep the code concise and readable, certain architectural
+choices (such as discrete latents and the symlog loss) from the full
+DreamerV3 implementation are approximated here.  The encoder and
+decoder architectures are modest and may need to be scaled up for
+large‑scale experiments.
+"""
+from __future__ import annotations
+
+from typing import Tuple, Dict, List
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
-from lib.critic import value_bins, symexp, symlog, two_hot_encode
-from lib.nn_blocks import ResidualMLP
-
 
 class Encoder(nn.Module):
-    """
-    Encode image or vector observations into a fixed‑size embedding.
+    """Encode observations into feature vectors.
 
-    If the observation has three dimensions it is assumed to be an image in
-    (C, H, W) format and a small convolutional network is used.  Otherwise a
-    simple multilayer perceptron (MLP) is applied.  Observations are scaled
-    to the range ``[0, 1]`` for images.
+    For image inputs, we employ a simple convolutional stack similar to
+    the one used in the Dreamer paper: four convolutional layers with
+    increasing channel counts and stride 2.  For vector inputs, a two‑layer
+    MLP is used.
     """
 
-    def __init__(self, obs_shape: Tuple[int, ...], embed_size: int = 1024) -> None:
+    def __init__(self, obs_shape: Tuple[int, ...], embed_size: int = 1024):
         super().__init__()
+        self.obs_shape = obs_shape
         self.embed_size = embed_size
         if len(obs_shape) == 3:
             c, h, w = obs_shape
             self.is_image = True
             self.conv = nn.Sequential(
                 nn.Conv2d(c, 32, kernel_size=4, stride=2),
-                nn.SiLU(inplace=True),
+                nn.ReLU(),
                 nn.Conv2d(32, 64, kernel_size=4, stride=2),
-                nn.SiLU(inplace=True),
+                nn.ReLU(),
                 nn.Conv2d(64, 128, kernel_size=4, stride=2),
-                nn.SiLU(inplace=True),
+                nn.ReLU(),
                 nn.Conv2d(128, 256, kernel_size=4, stride=2),
-                nn.SiLU(inplace=True),
+                nn.ReLU(),
             )
-            conv_out_dim = self._get_conv_out(obs_shape)
-            self.fc = nn.Linear(conv_out_dim, embed_size)
+            # compute output size
+            with torch.no_grad():
+                x = torch.zeros(1, *obs_shape)
+                out = self.conv(x)
+                self.conv_out_size = out.view(1, -1).size(1)
+            self.fc = nn.Linear(int(self.conv_out_size), embed_size)
         else:
-            # Vector observation
             self.is_image = False
             self.fc = nn.Sequential(
                 nn.Linear(obs_shape[0], embed_size),
-                nn.SiLU(inplace=True),
+                nn.ReLU(),
                 nn.Linear(embed_size, embed_size),
-                nn.SiLU(inplace=True),
+                nn.ReLU(),
             )
 
-    @torch.no_grad()
-    def _get_conv_out(self, shape: Tuple[int, ...]) -> int:
-        o = self.conv(torch.zeros(1, *shape))
-        return int(o.nelement() / o.size(0))
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Encode observations.
-
-        Args:
-            x: A tensor of shape ``(B, *obs_shape)`` or ``(B, T, *obs_shape)``.
-
-        Returns:
-            A tensor of shape ``(B, T, embed_size)`` if a sequence was given,
-            otherwise ``(B, embed_size)``.
-        """
+    def forward(self, obs: torch.Tensor) -> torch.Tensor:
         if self.is_image:
-            x = x.float() / 255.0
-            if x.dim() == 5:
-                b, t, c, h, w = x.shape
-                x_flat = x.view(b * t, c, h, w)
-                h = self.conv(x_flat)
-                h = h.view(b * t, -1)
-                h = self.fc(h)
-                return h.view(b, t, -1)
+            x = obs.float() / 255.0
+            # convert to NCHW
+            if x.ndim == 5:  # sequence batch: (B, T, C, H, W)
+                b, t, c, h, w = x.size()
+                x = x.view(-1, c, h, w)
+                out = self.conv(x)
+                out = out.reshape(b, t, -1)
+                out = self.fc(out)
+                return out
             else:
-                h = self.conv(x)
-                h = h.view(h.size(0), -1)
-                return self.fc(h)
+                out = self.conv(x)
+                out = out.reshape(out.size(0), -1)
+                out = self.fc(out)
+                return out
         else:
-            # Vector input
-            if x.dim() == 3:
-                b, t, d = x.shape
-                h = x.view(b * t, d)
-                h = self.fc(h)
-                return h.view(b, t, -1)
-            else:
-                return self.fc(x)
-
-
-class RSSMPrior(nn.Module):
-    """
-    Prior network of the recurrent state space model.
-
-    Predicts the next latent state and deterministic belief given the current
-    stochastic latent state and an action.  The design follows the TorchRL
-    implementation but uses plain PyTorch modules.  A small MLP processes
-    the concatenated latent and action before a GRUCell updates the belief.
-    """
-
-    def __init__(
-            self,
-            stoch_size: int,
-            action_size: int,
-            deter_size: int = 200,
-            hidden_size: int | None = None,
-            scale_lb: float = 0.1,
-    ) -> None:
-        super().__init__()
-        self.stoch_size = stoch_size
-        self.action_size = action_size
-        self.deter_size = deter_size
-        self.scale_lb = scale_lb
-        hid = hidden_size or deter_size
-        # ResidualMLP to project [z, a] into hidden space for the GRU
-        self.action_state_projector = ResidualMLP(in_dim=stoch_size + action_size, out_dim=hid, units=hid, depth=2)
-        self.rnn = nn.GRUCell(hid, deter_size)
-        # ResidualMLP to map belief to Gaussian parameters
-        self.rnn_to_prior_projector = ResidualMLP(in_dim=deter_size, out_dim=2 * stoch_size, units=hid, depth=2)
-
-    def forward(
-            self,
-            stoch: torch.Tensor,
-            belief: torch.Tensor,
-            action: torch.Tensor,
-    ) -> tuple[Any, Tensor, Tensor, Any]:
-        """
-        One step forward of the prior.
-
-        Args:
-            stoch: Current stochastic latent state ``(B, stoch_size)``.
-            belief: Current deterministic belief ``(B, deter_size)``.
-            action: Action taken at the current time step ``(B, action_size)``.
-
-        Returns:
-            A tuple ``(mean, std, next_stoch)``, where ``mean`` and ``std`` are
-            the parameters of the predicted distribution of the next stochastic
-            latent state and ``next_stoch`` is a sample drawn using the
-            reparameterisation trick.
-        """
-        # Project concatenated [z, a] to GRU input
-        x = torch.cat([stoch, action], dim=-1)
-        h = self.action_state_projector(x)
-        belief = self.rnn(h, belief)
-        params = self.rnn_to_prior_projector(belief)
-        mean, log_std = params.chunk(2, dim=-1)
-        # Softplus to ensure positivity; clamp to lower bound
-        std = F.softplus(log_std) + self.scale_lb
-        next_stoch = mean + torch.randn_like(std) * std
-        return mean, std, next_stoch, belief
-
-
-class RSSMPosterior(nn.Module):
-    """
-    Posterior network of the recurrent state space model.
-
-    Combines the current belief and the observation embedding to refine the
-    stochastic latent state.  A small MLP produces the mean and standard
-    deviation of the posterior distribution.
-    """
-
-    def __init__(
-            self,
-            deter_size: int,
-            embed_size: int,
-            stoch_size: int = 30,
-            hidden_size: int | None = None,
-            scale_lb: float = 0.1,
-    ) -> None:
-        super().__init__()
-        hid = hidden_size or deter_size
-        self.deter_size = deter_size
-        self.embed_size = embed_size
-        self.stoch_size = stoch_size
-        self.scale_lb = scale_lb
-        self.mlp = ResidualMLP(in_dim=deter_size + embed_size, out_dim=2 * stoch_size, units=hid, depth=2)
-
-    def forward(self, belief: torch.Tensor, embed: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        params = self.mlp(torch.cat([belief, embed], dim=-1))
-        mean, log_std = params.chunk(2, dim=-1)
-        std = F.softplus(log_std) + self.scale_lb
-        stoch = mean + torch.randn_like(std) * std
-        return mean, std, stoch
-
-
-class RSSM(nn.Module):
-    """
-    Container for prior and posterior models in the recurrent state space model.
-
-    This class orchestrates the computation of prior and posterior sequences.  It
-    exposes ``init_state``, ``observe`` and ``imagine`` methods for use in
-    training and policy/value optimisation.
-    """
-
-    def __init__(
-            self,
-            action_size: int,
-            embed_size: int,
-            deter_size: int = 200,
-            stoch_size: int = 30,
-            scale_lb: float = 0.1,
-    ) -> None:
-        super().__init__()
-        self.action_size = action_size
-        self.embed_size = embed_size
-        self.deter_size = deter_size
-        self.stoch_size = stoch_size
-        self.prior = RSSMPrior(stoch_size, action_size, deter_size, scale_lb=scale_lb)
-        self.posterior = RSSMPosterior(deter_size, embed_size, stoch_size, scale_lb=scale_lb)
-
-    def init_state(self, batch_size: int, device: torch.device | None = None) -> Dict[str, torch.Tensor]:
-        device = device or next(self.parameters()).device
-        return {
-            "deter": torch.zeros(batch_size, self.deter_size, device=device),
-            "stoch": torch.zeros(batch_size, self.stoch_size, device=device),
-        }
-
-    def observe(
-            self,
-            embeds: torch.Tensor,
-            actions: torch.Tensor,
-            state: Dict[str, torch.Tensor],
-    ) -> Tuple[List[Dict[str, torch.Tensor]], List[Dict[str, torch.Tensor]]]:
-        """
-        Compute posterior and prior sequences given embeddings and actions.
-
-        Args:
-            embeds: Observation embeddings of shape ``(B, T, embed_size)``.
-            actions: Actions of shape ``(B, T, action_size)`` (one‑hot or
-                continuous).
-            state: Initial state dict with keys ``"deter"`` and ``"stoch"``.
-
-        Returns:
-            ``posteriors`` and ``priors``, each a list of state dictionaries of
-            length ``T`` with keys ``deter``, ``stoch``, ``mean`` and ``std``.
-        """
-        b, t, _ = embeds.shape
-        deter = state["deter"]
-        stoch = state["stoch"]
-        posteriors: List[Dict[str, torch.Tensor]] = []
-        priors: List[Dict[str, torch.Tensor]] = []
-        for i in range(t):
-            a = actions[:, i]
-            # Prior update
-            prior_mean, prior_std, stoch_prior, deter = self.prior(stoch, deter, a)
-            priors.append({
-                "deter": deter,
-                "stoch": stoch_prior,
-                "mean": prior_mean,
-                "std": prior_std,
-            })
-            # Posterior update uses embedding
-            e = embeds[:, i]
-            post_mean, post_std, stoch_post = self.posterior(deter, e)
-            posteriors.append({
-                "deter": deter,
-                "stoch": stoch_post,
-                "mean": post_mean,
-                "std": post_std,
-            })
-            stoch = stoch_post
-        return posteriors, priors
-
-    def imagine(
-            self,
-            actions: torch.Tensor,
-            state: Dict[str, torch.Tensor],
-    ) -> List[Dict[str, torch.Tensor]]:
-        """
-        Roll out prior states given actions and an initial state.
-
-        Args:
-            actions: Tensor of shape ``(B, T, action_size)``.
-            state: Dict with keys ``"deter"`` and ``"stoch"``.
-
-        Returns:
-            List of prior state dicts of length ``T``.
-        """
-        b, t, _ = actions.shape
-        deter = state["deter"]
-        stoch = state["stoch"]
-        priors: List[Dict[str, torch.Tensor]] = []
-        for i in range(t):
-            a = actions[:, i]
-            mean, std, stoch, deter = self.prior(stoch, deter, a)
-            priors.append({
-                "deter": deter,
-                "stoch": stoch,
-                "mean": mean,
-                "std": std,
-            })
-        return priors
+            return self.fc(obs.float())
 
 
 class Decoder(nn.Module):
-    """
-    Observation decoder mapping latent features back to observations.
-
-    For image observations the decoder uses a series of transposed
-    convolutions.  For vector observations it uses a multi‑layer perceptron.
-    """
-
-    def __init__(
-            self,
-            obs_shape: Tuple[int, ...],
-            deter_size: int,
-            stoch_size: int,
-            hidden_size: int = 1024,
-    ) -> None:
+    def __init__(self, obs_shape: Tuple[int, ...], deter_size: int, stoch_size: int, embed_size: int = 1024):
         super().__init__()
+        self.obs_shape = obs_shape
         self.is_image = len(obs_shape) == 3
         input_size = deter_size + stoch_size
         if self.is_image:
             c, h, w = obs_shape
-            # Start from a small spatial map and upsample to the desired size
-            self.fc = nn.Linear(input_size, 256 * 2 * 2)
+
+            # We will upsample by 2 four times: start_size * 2^4 == target_size
+            # so start_h = h // 16, start_w = w // 16 (assumes divisibility).
+            assert h % 16 == 0 and w % 16 == 0, \
+                f"Decoder expects H and W divisible by 16, got {(h, w)}"
+            start_h, start_w = h // 16, w // 16
+
+            self.fc = nn.Linear(input_size, 256 * start_h * start_w)
+
             self.deconv = nn.Sequential(
-                nn.ConvTranspose2d(256, 128, kernel_size=4, stride=2, padding=1),
-                nn.SiLU(inplace=True),
-                nn.ConvTranspose2d(128, 64, kernel_size=4, stride=2, padding=1),
-                nn.SiLU(inplace=True),
-                nn.ConvTranspose2d(64, 32, kernel_size=4, stride=2, padding=1),
-                nn.SiLU(inplace=True),
-                nn.ConvTranspose2d(32, 16, kernel_size=4, stride=2, padding=1),
-                nn.SiLU(inplace=True),
-                nn.ConvTranspose2d(16, c, kernel_size=4, stride=2, padding=1),
+                # (start_h, start_w) -> *2
+                nn.ConvTranspose2d(256, 128, kernel_size=5, stride=2, padding=2, output_padding=1),
+                nn.ReLU(),
+                # -> *2
+                nn.ConvTranspose2d(128, 64, kernel_size=5, stride=2, padding=2, output_padding=1),
+                nn.ReLU(),
+                # -> *2
+                nn.ConvTranspose2d(64, 32, kernel_size=5, stride=2, padding=2, output_padding=1),
+                nn.ReLU(),
+                # -> *2 (now at target H×W)
+                nn.ConvTranspose2d(32, c, kernel_size=5, stride=2, padding=2, output_padding=1),
             )
+
+            self._start_hw = (start_h, start_w)
+
         else:
-            self.mlp = nn.Sequential(
-                nn.Linear(input_size, hidden_size),
-                nn.SiLU(inplace=True),
-                nn.Linear(hidden_size, hidden_size),
-                nn.SiLU(inplace=True),
-                nn.Linear(hidden_size, obs_shape[0]),
+            self.fc = nn.Sequential(
+                nn.Linear(input_size, embed_size),
+                nn.ReLU(),
+                nn.Linear(embed_size, embed_size),
+                nn.ReLU(),
+                nn.Linear(embed_size, obs_shape[0]),
             )
 
     def forward(self, deter: torch.Tensor, stoch: torch.Tensor) -> torch.Tensor:
         x = torch.cat([deter, stoch], dim=-1)
         if self.is_image:
-            h = self.fc(x)
-            h = h.view(h.size(0), 256, 2, 2)
-            return self.deconv(h)
+            start_h, start_w = self._start_hw
+            out = self.fc(x)
+            out = out.view(out.size(0), 256, start_h, start_w)
+            out = self.deconv(out)  # (B, C, H, W) exactly matching obs_shape
+            return out
         else:
-            return self.mlp(x)
+            return self.fc(x)
+
+
+class RSSM(nn.Module):
+    """Recurrent State‑Space Model (RSSM).
+
+    This class maintains a deterministic hidden state `h_t` and a stochastic
+    latent state `z_t` at each timestep.  Given a previous model state and
+    an action, it updates the deterministic state through a GRU cell and
+    outputs the prior distribution over the next stochastic state.  When
+    provided with an encoded observation, it also produces the posterior
+    distribution over the stochastic state (observation model).
+    """
+
+    def __init__(
+            self,
+            action_size: int,
+            embed_size: int,
+            deter_size: int = 200,
+            stoch_size: int = 30,
+    ):
+        super().__init__()
+        self.action_size = action_size
+        self.embed_size = embed_size
+        self.deter_size = deter_size
+        self.stoch_size = stoch_size
+
+        # deterministic transition model
+        self.gru = nn.GRUCell(stoch_size + action_size, deter_size)
+        # prior: maps deterministic state to parameters of the stochastic latent
+        self.prior_mean = nn.Linear(deter_size, stoch_size)
+        self.prior_logstd = nn.Linear(deter_size, stoch_size)
+        # posterior (observation) model: maps deterministic state and embed to posterior params
+        self.post_mean = nn.Linear(deter_size + embed_size, stoch_size)
+        self.post_logstd = nn.Linear(deter_size + embed_size, stoch_size)
+
+    def init_state(self, batch_size: int, device: torch.device = torch.device("cpu")) -> Dict[str, torch.Tensor]:
+        """Initialize deterministic and stochastic states with zeros."""
+        return {
+            "deter": torch.zeros(batch_size, self.deter_size, device=device),
+            "stoch": torch.zeros(batch_size, self.stoch_size, device=device),
+        }
+
+    def _prior(self, deter: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        mean = self.prior_mean(deter)
+        logstd = self.prior_logstd(deter)
+        return mean, logstd
+
+    def _posterior(self, deter: torch.Tensor, embed: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        h = torch.cat([deter, embed], dim=-1)
+        mean = self.post_mean(h)
+        logstd = self.post_logstd(h)
+        return mean, logstd
+
+    @staticmethod
+    def _sample(mean: torch.Tensor, logstd: torch.Tensor) -> torch.Tensor:
+        std = torch.exp(logstd)
+        eps = torch.randn_like(mean)
+        return mean + eps * std
+
+    def observe(self, embed: torch.Tensor, actions: torch.Tensor, prev_state: Dict[str, torch.Tensor]) -> Tuple[
+        List[Dict[str, torch.Tensor]], List[Dict[str, torch.Tensor]]]:
+        """Compute posterior and prior sequences given embeddings and actions.
+
+        Args:
+            embed: Tensor of shape (batch, time, embed_size).
+            actions: Tensor of shape (batch, time, action_size), preprocessed
+                actions from the environment.
+            prev_state: Initial deterministic and stochastic states for the
+                sequence.
+
+        Returns:
+            A pair (posterior_states, prior_states).  Each is a list of dicts
+            containing the keys 'deter', 'stoch', 'mean', 'logstd'.  The lists
+            have length equal to the sequence length.
+        """
+        batch, time, _ = embed.size()
+        deter = prev_state["deter"]
+        stoch = prev_state["stoch"]
+        posterior_states: List[Dict[str, torch.Tensor]] = []
+        prior_states: List[Dict[str, torch.Tensor]] = []
+        for t in range(time):
+            a = actions[:, t]
+            x = embed[:, t]
+            # Combine stochastic state and action to update deterministic state
+            gru_input = torch.cat([stoch, a], dim=-1)
+            deter = self.gru(gru_input, deter)
+            # Prior predicts next latent from deterministic state
+            mean_prior, logstd_prior = self._prior(deter)
+            z_prior = self._sample(mean_prior, logstd_prior)
+            prior_states.append({
+                "deter": deter,
+                "stoch": z_prior,
+                "mean": mean_prior,
+                "logstd": logstd_prior,
+            })
+            # Posterior uses observation
+            mean_post, logstd_post = self._posterior(deter, x)
+            z_post = self._sample(mean_post, logstd_post)
+            posterior_states.append({
+                "deter": deter,
+                "stoch": z_post,
+                "mean": mean_post,
+                "logstd": logstd_post,
+            })
+            stoch = z_post
+        return posterior_states, prior_states
+
+    def imagine(self, actions: torch.Tensor, start_state: Dict[str, torch.Tensor]) -> List[Dict[str, torch.Tensor]]:
+        """Roll out prior latent states given actions and an initial model state.
+
+        This method is used for imagination during policy and value training.
+
+        Args:
+            actions: Tensor of shape (batch, time, action_size).
+            start_state: Dict containing the initial deterministic and stochastic
+                states.
+
+        Returns:
+            A list of prior state dicts of length equal to the time horizon.
+        """
+        batch, time, _ = actions.size()
+        deter = start_state["deter"]
+        stoch = start_state["stoch"]
+        priors: List[Dict[str, torch.Tensor]] = []
+        for t in range(time):
+            a = actions[:, t]
+            gru_input = torch.cat([stoch, a], dim=-1)
+            deter = self.gru(gru_input, deter)
+            mean, logstd = self._prior(deter)
+            stoch = self._sample(mean, logstd)
+            priors.append({
+                "deter": deter,
+                "stoch": stoch,
+                "mean": mean,
+                "logstd": logstd,
+            })
+        return priors
 
 
 class RewardPredictor(nn.Module):
-    def __init__(self, deter_size: int, stoch_size: int, units: int = 256, depth: int = 3,
-                 num_bins: int = 255) -> None:
+    """Predict immediate rewards from latent and hidden states."""
+
+    def __init__(self, deter_size: int, stoch_size: int, hidden_size: int = 400):
         super().__init__()
-        self.num_bins = num_bins
-        self.register_buffer("bins_symlog", value_bins(num_bins), persistent=False)
-        self.mlp = ResidualMLP(deter_size + stoch_size, num_bins, units=units, depth=depth, zero_init=True)
+        self.fc = nn.Sequential(
+            nn.Linear(deter_size + stoch_size, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, 1),
+        )
 
     def forward(self, deter: torch.Tensor, stoch: torch.Tensor) -> torch.Tensor:
-        # returns logits over bins
-        return self.mlp(torch.cat([deter, stoch], dim=-1))
-
-    @torch.no_grad()
-    def value(self, deter: torch.Tensor, stoch: torch.Tensor) -> torch.Tensor:
-        # expected reward from logits (used for λ-returns in imagination)
-        logits = self.forward(deter, stoch)
-        probs = logits.softmax(dim=-1)
-        exp_symlog = (probs * self.bins_symlog).sum(dim=-1)
-        return symexp(exp_symlog)
+        x = torch.cat([deter, stoch], dim=-1)
+        return self.fc(x).squeeze(-1)
 
 
 class ContinuePredictor(nn.Module):
-    def __init__(self, deter_size: int, stoch_size: int, units: int = 256, depth: int = 3) -> None:
+    """Predict episode continuation flag (1 − done) from latent and hidden states."""
+
+    def __init__(self, deter_size: int, stoch_size: int, hidden_size: int = 200):
         super().__init__()
-        self.mlp = ResidualMLP(deter_size + stoch_size, 1, units=units, depth=depth)
+        self.fc = nn.Sequential(
+            nn.Linear(deter_size + stoch_size, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, 1),
+        )
 
     def forward(self, deter: torch.Tensor, stoch: torch.Tensor) -> torch.Tensor:
-        return self.mlp(torch.cat([deter, stoch], dim=-1)).squeeze(-1)
+        x = torch.cat([deter, stoch], dim=-1)
+        return self.fc(x).squeeze(-1)
 
 
 class WorldModel(nn.Module):
-    def __init__(self, obs_shape: Tuple[int, ...], action_size: int,
-                 embed_size: int = 1024, deter_size: int = 200, stoch_size: int = 30,
-                 free_nats: float = 1.0, beta_pred: float = 1.0, beta_dyn: float = 0.5, beta_rep: float = 0.1,
-                 units: int = 256, depth: int = 3) -> None:
+    """Container class wrapping the RSSM, encoder, decoder and predictors.
+
+    This class orchestrates the world model components and provides higher
+    level interfaces for computing training losses and generating imagined
+    trajectories.
+    """
+
+    def __init__(
+            self,
+            obs_shape: Tuple[int, ...],
+            action_size: int,
+            embed_size: int = 1024,
+            deter_size: int = 200,
+            stoch_size: int = 30,
+            free_nats: float = 1.0,
+            beta_pred: float = 1.0,
+            beta_dyn: float = 1.0,
+            beta_rep: float = 0.1,
+    ):
         super().__init__()
         self.encoder = Encoder(obs_shape, embed_size)
         self.rssm = RSSM(action_size, embed_size, deter_size, stoch_size)
         self.decoder = Decoder(obs_shape, deter_size, stoch_size, embed_size)
-        self.reward_predictor = RewardPredictor(deter_size, stoch_size, units=units, depth=depth)
-        self.continue_predictor = ContinuePredictor(deter_size, stoch_size, units=units, depth=depth)
+        self.reward_predictor = RewardPredictor(deter_size, stoch_size)
+        self.continue_predictor = ContinuePredictor(deter_size, stoch_size)
+        self.embed_size = embed_size
+        self.action_size = action_size
+        self.deter_size = deter_size
+        self.stoch_size = stoch_size
         self.free_nats = free_nats
         self.beta_pred = beta_pred
         self.beta_dyn = beta_dyn
         self.beta_rep = beta_rep
-        self.deter_size = deter_size
-        self.stoch_size = stoch_size
 
-    def init_state(self, batch_size: int, device: torch.device | None = None) -> Dict[str, torch.Tensor]:
+    def init_state(self, batch_size: int, device: torch.device = torch.device("cpu")) -> Dict[str, torch.Tensor]:
         return self.rssm.init_state(batch_size, device)
 
-    @staticmethod
-    def get_feat(state: Dict[str, torch.Tensor]) -> torch.Tensor:
-        return torch.cat([state["deter"], state["stoch"]], dim=-1)
-
-    @staticmethod
-    def _kl_gauss(m1, s1, m2, s2):
-        s1 = s1 + 1e-8
-        s2 = s2 + 1e-8
-        term = torch.log(s2 / s1) + (s1 ** 2 + (m1 - m2) ** 2) / (2 * s2 ** 2) - 0.5
-        return term.sum(-1)
-
-    def _kl_split(self, mean_post, std_post, mean_prior, std_prior):
-        # dynamics: KL(sg(q) || p), representation: KL(q || sg(p))
-        kl_dyn = self._kl_gauss(mean_post.detach(), std_post.detach(), mean_prior, std_prior)
-        kl_rep = self._kl_gauss(mean_post, std_post, mean_prior.detach(), std_prior.detach())
-        # free bits (per-step then mean)
-        fb = self.free_nats
-        return torch.clamp(kl_dyn, min=fb).mean(), torch.clamp(kl_rep, min=fb).mean()
+    def get_feat(self, states: Dict[str, torch.Tensor]) -> torch.Tensor:
+        """Combine deterministic and stochastic parts into a feature vector."""
+        return torch.cat([states["deter"], states["stoch"]], dim=-1)
 
     def imagine(self, actions: torch.Tensor, start_state: Dict[str, torch.Tensor]) -> Tuple[
         torch.Tensor, List[Dict[str, torch.Tensor]]]:
+        """Generate imagined trajectories given actions.
+
+        Args:
+            actions: Tensor of shape (batch, time, action_size).
+            start_state: Dict containing deterministic and stochastic state.
+
+        Returns:
+            A tuple (features, states) where features is a tensor of shape
+            (batch, time, deter_size + stoch_size) and states is a list of
+            state dicts at each time step.
+        """
         priors = self.rssm.imagine(actions, start_state)
         feats = [self.get_feat(s) for s in priors]
         return torch.stack(feats, dim=1), priors
 
     def loss(self, obs: torch.Tensor, actions: torch.Tensor, rewards: torch.Tensor, continues: torch.Tensor,
-             state: Dict[str, torch.Tensor]) -> Tuple[
-        torch.Tensor, List[Dict[str, torch.Tensor]], List[Dict[str, torch.Tensor]]]:
-        embeds = self.encoder(obs)
-        post, prior = self.rssm.observe(embeds, actions, state)
+             prev_state: Dict[str, torch.Tensor]) -> tuple[Tensor, list[dict[str, Tensor]], list[dict[str, Tensor]]]:
+        """Compute world model training loss.
 
+        Args:
+            obs: Tensor of shape (batch, time, *obs_shape) containing raw observations.
+            actions: Tensor of shape (batch, time, action_size) containing actions.
+            rewards: Tensor of shape (batch, time) with rewards.
+            continues: Tensor of shape (batch, time) with continuation flags (1−done).
+            prev_state: Initial model state dict.
+
+        Returns:
+            A tuple (loss, post, prior) where loss is a scalar tensor,
+            post/prior are lists of state dicts from the posterior/prior sequences.
+        """
+        # Encode observations
+        embed = self.encoder(obs)  # (batch, time, embed_size)
+        # Run through RSSM
+        post, prior = self.rssm.observe(embed, actions, prev_state)
+        # Convert lists to tensors for convenience
         deter_post = torch.stack([s["deter"] for s in post], dim=1)
         stoch_post = torch.stack([s["stoch"] for s in post], dim=1)
-
-        b, t = deter_post.shape[:2]
-        flat_deter = deter_post.reshape(b * t, -1)
-        flat_stoch = stoch_post.reshape(b * t, -1)
-
-        recon = self.decoder(flat_deter, flat_stoch)
-        if recon.dim() == 4:  # images: recon is (b*t, C, H, W)
-            recon = recon.view(b, t, *recon.shape[1:])
-            target = (obs.float() / 255.0)
-
-            # --- Smooth L1 (Huber) with delta=0.1 (good for small objects) ---
-            perpx = F.smooth_l1_loss(recon, target, beta=0.1, reduction="none")  # (b, t, C, H, W)
-
-            # --- motion weighting (emphasize moving pixels) ---
-            with torch.no_grad():
-                # temporal absolute diff magnitude in grayscale
-                gray = target.mean(dim=2, keepdim=True)  # (b, t, 1, H, W)
-                # weight t>=1 by motion; t=0 uses the same weight as t=1
-                motion = torch.zeros_like(gray)
-                motion[:, 1:] = (gray[:, 1:] - gray[:, :-1]).abs()
-                motion[:, 0] = motion[:, 1]
-                # normalize and floor the weight (0.1–1.0)
-                w = motion / (motion.amax(dim=(2, 3, 4), keepdim=True).clamp_min(1e-6))
-                w = w.clamp_(0.0, 1.0) * 0.9 + 0.1
-
-            # apply weighting (broadcast over channels)
-            perpx = perpx * w
-
-            # average over C,H,W then (b,t)
-            recon_loss = perpx.mean(dim=(2, 3, 4)).mean()
-
-        else:  # vector observations
-            recon = recon.view(b, t, -1)
-            target = obs.float()
-            recon_loss = F.smooth_l1_loss(recon, target, beta=0.1, reduction="none").mean(dim=2).mean()
-
-        reward_logits = self.reward_predictor(flat_deter, flat_stoch)  # (b*t, K)
-        y_symlog = symlog(rewards.reshape(-1))
-        min_bin, max_bin = self.reward_predictor.bins_symlog[[0, -1]]
-        y_symlog = y_symlog.clamp(min_bin.item(), max_bin.item())
-        target_twohot = two_hot_encode(y_symlog, self.reward_predictor.bins_symlog)
-
-        reward_loss = -(target_twohot.detach() * reward_logits.log_softmax(dim=-1)).sum(dim=-1).mean()
-
-        cont_pred = self.continue_predictor(flat_deter, flat_stoch).view(b, t)
+        deter_prior = torch.stack([s["deter"] for s in prior], dim=1)
+        stoch_prior = torch.stack([s["stoch"] for s in prior], dim=1)
+        # Reconstruction
+        if len(obs.shape) == 5:
+            # image observations: (batch, time, C, H, W)
+            recon = []
+            batch, time, C, H, W = obs.size()
+            for t in range(time):
+                dec = self.decoder(
+                    deter_post[:, t].reshape(-1, self.deter_size),
+                    stoch_post[:, t].reshape(-1, self.stoch_size),
+                )
+                # dec is already (B, C, H, W); don't .view() it
+                recon.append(dec)
+            recon = torch.stack(recon, dim=1)
+            recon_loss = F.mse_loss(recon, obs.float(), reduction="none").mean(dim=(2, 3, 4)).mean()
+        else:
+            # vector observations
+            recon = []
+            for t in range(obs.size(1)):
+                dec = self.decoder(deter_post[:, t], stoch_post[:, t])
+                recon.append(dec)
+            recon = torch.stack(recon, dim=1)
+            recon_loss = F.mse_loss(recon, obs.float(), reduction="none").mean(dim=2).mean()
+        # Reward prediction
+        reward_pred = []
+        for t in range(len(post)):
+            pred = self.reward_predictor(deter_post[:, t], stoch_post[:, t])
+            reward_pred.append(pred)
+        reward_pred = torch.stack(reward_pred, dim=1)
+        reward_loss = F.mse_loss(reward_pred, rewards, reduction="none").mean()
+        # Continue prediction
+        cont_pred = []
+        for t in range(len(post)):
+            pred = self.continue_predictor(deter_post[:, t], stoch_post[:, t])
+            cont_pred.append(pred)
+        cont_pred = torch.stack(cont_pred, dim=1)
         cont_loss = F.binary_cross_entropy_with_logits(cont_pred, continues, reduction="none").mean()
-
-        mean_post = torch.stack([s["mean"] for s in post], dim=1).view(b * t, -1)
-        std_post = torch.stack([s["std"] for s in post], dim=1).view(b * t, -1)
-        mean_prior = torch.stack([s["mean"] for s in prior], dim=1).view(b * t, -1)
-        std_prior = torch.stack([s["std"] for s in prior], dim=1).view(b * t, -1)
-
-        kl_dyn, kl_rep = self._kl_split(mean_post, std_post, mean_prior, std_prior)
-        pred_loss = recon_loss + reward_loss + cont_loss
-        total = self.beta_pred * pred_loss + self.beta_dyn * kl_dyn + self.beta_rep * kl_rep
-        return total, post, prior
+        # KL divergence between posterior and prior
+        # Compute means and log stds
+        mean_post = torch.stack([s["mean"] for s in post], dim=1)
+        logstd_post = torch.stack([s["logstd"] for s in post], dim=1)
+        mean_prior = torch.stack([s["mean"] for s in prior], dim=1)
+        logstd_prior = torch.stack([s["logstd"] for s in prior], dim=1)
+        # KL divergence per timestep and element
+        kl_div = 0.5 * (
+                (logstd_prior - logstd_post).exp() ** 2 +
+                ((mean_post - mean_prior) / (logstd_prior.exp() + 1e-6)) ** 2 +
+                2 * (logstd_prior - logstd_post) - 1
+        )
+        kl_div = kl_div.sum(dim=-1).mean()  # average over batch and time
+        # Apply free nats (free bits) to prevent KL from shrinking too much【145968576409203†L389-L403】
+        kl_loss = torch.max(kl_div, torch.tensor(self.free_nats, device=kl_div.device))
+        # Combine losses with weights
+        loss = self.beta_pred * (recon_loss + reward_loss + cont_loss) + self.beta_dyn * kl_loss
+        # representation loss is omitted for simplicity; representation regularizer can be added here
+        return loss, post, prior
