@@ -25,12 +25,12 @@ class Actor(nn.Module):
         self.entropy_scale = entropy_scale
 
         layers = []
-        input_size = state_size
+        dim = state_size
         for _ in range(depth):
-            layers.append(nn.LayerNorm(input_size))
-            layers.append(nn.Linear(input_size, hidden))
+            layers.append(nn.LayerNorm(dim))
+            layers.append(nn.Linear(dim, hidden))
             layers.append(nn.SiLU())
-            input_size = hidden
+            dim = hidden
         self.mlp = nn.Sequential(*layers)
         self.head = nn.Linear(hidden, action_size)
 
@@ -39,7 +39,6 @@ class Actor(nn.Module):
         """
         Convert WorldModelState to a flat feature vector.
         Works for both single states (B,H) and sequences of states (B,T,H).
-        Also stops gradients to the world model.
         """
         h, z = s.h, s.z
         # Support (B,H) or (B,T,H)
@@ -51,17 +50,14 @@ class Actor(nn.Module):
             B, H = h.shape
             z_flat = z.reshape(B, -1)  # (B,L*K)
             features = torch.cat([h, z_flat], dim=-1)  # (B,H+L*K)
-
-        features = features.detach()  # No gradients to world model
         return features
 
-    def forward(self, model_state: WorldModelState) -> torch.distributions.Distribution:
-        x = self._state_vec(model_state)
+    def forward(self, model_states: WorldModelState) -> torch.distributions.Distribution:
+        x = self._state_vec(model_states)
         # Support sequences of states (B,T,H+L*K) or single states (B,H+L*K)
         if x.dim() == 3:
             B, T, D = x.shape
-            x = x.reshape(B * T, D)
-            x = self.mlp(x)
+            x = self.mlp(x.reshape(B * T, D))
             logits = self.head(x).reshape(B, T, -1)
         else:
             x = self.mlp(x)
@@ -70,18 +66,18 @@ class Actor(nn.Module):
 
     def loss(
             self,
-            model_state: WorldModelState,
+            model_states: WorldModelState,
             actions: torch.Tensor,  # (B,) or (B,T) long indices
             returns: torch.Tensor,  # (B,) or (B,T) lambda-returns
             values: torch.Tensor  # (B,) or (B,T) predicted values
     ) -> torch.Tensor:
-        action_dist = self(model_state)
+        action_dist = self(model_states)
         log_probs = action_dist.log_prob(actions)
         entropy = action_dist.entropy().mean()
 
         # TODO: Use EMAPercentileScaler for advantage normalization
-        advantages = returns.detach() - values.detach()  # No gradients to values
-        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        advantages = returns - values
+        advantages = (advantages - advantages.mean()) / (advantages.std(unbiased=False) + 1e-8)
 
         policy_loss = -(log_probs * advantages).mean()
         loss = policy_loss - self.entropy_scale * entropy

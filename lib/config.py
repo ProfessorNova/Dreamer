@@ -13,8 +13,8 @@ class Config:
 
     # --- Hyperparameters ---
     # General
-    num_iterations: int = 1e7
-    replay_capacity: int = 1e6
+    num_iterations: int = 10_000_000
+    replay_capacity: int = 1_000_000
     batch_size: int = 16
     batch_length: int = 64
 
@@ -34,6 +34,9 @@ class Config:
     gamma: float = 0.997
     discount_horizon: int = int(1 / (1 - gamma))
     lam: float = 0.95
+    critic_num_buckets: int = 255
+    critic_bucket_min: float = -20.0
+    critic_bucket_max: float = 20.0
     critic_ema_decay: float = 0.98
     critic_ema_regularizer: float = 1.0
     return_normalization_scale: float = (0.95, 0.05)
@@ -54,9 +57,9 @@ class Config:
     create_artifacts: bool = True
     run_dir: str = os.path.join("runs", datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S"))
     checkpoint_dir: str = os.path.join(run_dir, "checkpoints")
-    log_interval: int = 1000
-    video_interval: int = 10_000
-    video_fps: int = 15
+    log_interval: int = 10
+    video_interval: int = 100
+    video_fps: int = 20
     video_max_frames: int = 1000
 
     # --- Random seed for reproducibility ---

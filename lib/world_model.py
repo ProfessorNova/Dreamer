@@ -26,15 +26,15 @@ class SequenceModel(nn.Module):
 
     def __init__(
             self,
-            num_actions: int,
+            action_size: int,
             h_dim: int = 512,
             num_latents: int = 32,
             classes_per_latent: int = 32,
             hidden: int = 512,
     ):
         super().__init__()
-        self.num_actions = num_actions
-        in_dim = h_dim + num_latents * classes_per_latent + num_actions
+        self.action_size = action_size
+        in_dim = h_dim + num_latents * classes_per_latent + action_size
         self.input_layer = nn.Sequential(
             nn.LayerNorm(in_dim),
             nn.Linear(in_dim, hidden),
@@ -47,12 +47,12 @@ class SequenceModel(nn.Module):
         Args:
             h_prev: (B, h_dim)
             z_prev: (B, num_latents, classes_per_latent)
-            a_prev_idx: (B,) with values in [0, num_actions-1]
+            a_prev_idx: (B,) with values in [0, action_size-1]
 
         Returns:
             h_t: (B, h_dim)
         """
-        a_onehot = F.one_hot(a_prev_idx, num_classes=self.num_actions).float()
+        a_onehot = F.one_hot(a_prev_idx, num_classes=self.action_size).float()
         z_flat = z_prev.reshape(z_prev.size(0), -1)
         x = torch.cat([h_prev, z_flat, a_onehot], dim=-1)
         x = self.input_layer(x)
@@ -311,7 +311,7 @@ class WorldModel(nn.Module):
     def __init__(
             self,
             obs_shape: Tuple[int, ...],
-            num_actions: int,
+            action_size: int,
             h_dim: int = 512,
             num_latents: int = 32,
             classes_per_latent: int = 32,
@@ -325,7 +325,7 @@ class WorldModel(nn.Module):
     ):
         super().__init__()
         self.obs_shape = obs_shape
-        self.num_actions = num_actions
+        self.action_size = action_size
         self.h_dim = h_dim
         self.num_latents = num_latents
         self.classes_per_latent = classes_per_latent
@@ -335,7 +335,7 @@ class WorldModel(nn.Module):
         self.beta_rep = beta_rep
 
         self.seq = SequenceModel(
-            num_actions=num_actions,
+            action_size=action_size,
             h_dim=h_dim,
             num_latents=num_latents,
             classes_per_latent=classes_per_latent,
@@ -532,7 +532,7 @@ class WorldModel(nn.Module):
             rewards: torch.Tensor,  # (B,T)
             continues: torch.Tensor,  # (B,T) {0, 1}
             init_state: Optional[WorldModelState] = None,
-    ) -> tuple[Tensor, dict[str, Tensor]]:
+    ) -> tuple[Tensor, dict[str, Any]]:
         """
         Roll out a subsequence of length T and compute DreamerV3 world-model loss.
         Returns (total_loss, metrics_dict).
@@ -542,7 +542,7 @@ class WorldModel(nn.Module):
 
         # -------------------
         # TODO: set action to 0 where continue is 0 (maybe handle it in the sequence forward function instead)
-        # a_onehot = F.one_hot(a_prev_idx, num_classes=self.num_actions).float()  # (B,A)
+        # a_onehot = F.one_hot(a_prev_idx, num_classes=self.action_size).float()  # (B,A)
         # if c_prev is not None:
         #     a_onehot = a_onehot * c_prev  # (B,1) -> zero vector when starting new episode
         # z_flat = z_prev.reshape(z_prev.size(0), -1)
@@ -613,10 +613,11 @@ class WorldModel(nn.Module):
         rep = torch.stack(rep_losses, dim=0).mean()
 
         total_loss = self.beta_pred * pred + self.beta_dyn * dyn + self.beta_rep * rep
-        metrics = {
+        tensor_dict: Dict[str, Any] = {
             "total_loss": total_loss,
             "pred_loss": pred,
             "dyn_loss": dyn,
             "rep_loss": rep,
+            "state": state,
         }
-        return total_loss, metrics
+        return total_loss, tensor_dict
