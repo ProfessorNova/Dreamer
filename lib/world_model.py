@@ -463,8 +463,8 @@ class WorldModel(nn.Module):
         """
         Mean squared error in symlog space.
         """
-        se = (pred - symlog(target)) ** 2
-        return 0.5 * se.mean(dim=reduce_over)
+        squared_error = (pred - symlog(target)) ** 2
+        return 0.5 * squared_error.sum(dim=reduce_over)
 
     def _sample_z(self, logits: torch.Tensor, hard: bool = True) -> torch.Tensor:
         log_prob = log_unimix(logits, self.unimix_eps, dim=-1)  # log of mixed probs

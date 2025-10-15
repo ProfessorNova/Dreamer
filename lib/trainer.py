@@ -112,7 +112,7 @@ def train(cfg: Config, summary_writer=None):
                 action_idx = dist.sample().item()
 
                 # log real-env policy stats
-                if summary_writer is not None and it % cfg.log_interval == 0 and it > 0 and env_step == 0:
+                if summary_writer is not None and it % cfg.log_interval == 0 and it > 0 and env_step == 0 and world_model_loss is not None:
                     ent_env = dist.entropy().mean().item()
                     summary_writer.add_scalar("policy/env_entropy", ent_env, it)
                     summary_writer.add_histogram("policy/env_probs", dist.probs, it)
@@ -226,7 +226,7 @@ def train(cfg: Config, summary_writer=None):
             optim_actor.step()
 
             # ---- Rich logging ----
-            if summary_writer is not None and it % cfg.log_interval == 0:
+            if summary_writer is not None and it % cfg.log_interval == 0 and it > 0:
                 # Aggregate imagination policy stats
                 ent_im = torch.stack([d.entropy().mean() for d in imagination_dists]).mean().item()
                 dist_im = imagination_dists[-1]
