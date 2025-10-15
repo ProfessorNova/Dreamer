@@ -48,6 +48,7 @@ def train(cfg: Config, summary_writer=None):
         entropy_scale=cfg.actor_entropy_scale,
         hidden=cfg.dense_hidden_units,
         depth=cfg.mlp_layers,
+        unimix_eps=cfg.unimix_eps,
     ).to(cfg.device)
 
     critic = Critic(

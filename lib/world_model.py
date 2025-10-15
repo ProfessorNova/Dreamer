@@ -7,23 +7,13 @@ import torch.nn.functional as F
 from torch import Tensor
 from torch.distributions import Categorical, kl_divergence
 
-from lib.utils import symlog
+from lib.utils import symlog, log_unimix
 
 
 @dataclass
 class WorldModelState:
     h: torch.Tensor  # (B, h_dim)
     z: torch.Tensor  # (B, num_latents, classes_per_latent)
-
-
-def log_unimix(logits: torch.Tensor, eps: float, dim: int = -1) -> torch.Tensor:
-    """
-    Returns log of the mixed probabilities, same shape as logits.
-    """
-    probs = logits.softmax(dim=dim)
-    K = logits.size(dim)
-    probs = (1.0 - eps) * probs + eps / float(K)
-    return probs.clamp_min(1e-8).log()
 
 
 class SequenceModel(nn.Module):
@@ -467,7 +457,7 @@ class WorldModel(nn.Module):
         return 0.5 * squared_error.sum(dim=reduce_over)
 
     def _sample_z(self, logits: torch.Tensor, hard: bool = True) -> torch.Tensor:
-        log_prob = log_unimix(logits, self.unimix_eps, dim=-1)  # log of mixed probs
+        log_prob = log_unimix(logits, self.unimix_eps, dim=-1)
         return F.gumbel_softmax(log_prob, hard=hard, dim=-1)
 
     def _kl_categorical_logits(self, q_logits: torch.Tensor, p_logits: torch.Tensor) -> torch.Tensor:

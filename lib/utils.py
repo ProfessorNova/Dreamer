@@ -1,5 +1,3 @@
-from typing import Any
-
 import gymnasium as gym
 import numpy as np
 import torch
@@ -14,6 +12,16 @@ def symlog(x: torch.Tensor) -> torch.Tensor:
 
 def symexp(x: torch.Tensor) -> torch.Tensor:
     return torch.sign(x) * (torch.expm1(torch.abs(x)))
+
+
+def log_unimix(logits: torch.Tensor, eps: float, dim: int = -1) -> torch.Tensor:
+    """
+    Returns log of the mixed probabilities, same shape as logits.
+    """
+    probs = logits.softmax(dim=dim)
+    K = logits.size(dim)
+    probs = (1.0 - eps) * probs + eps / float(K)
+    return probs.clamp_min(1e-8).log()
 
 
 class ImageToPyTorch(gym.ObservationWrapper):

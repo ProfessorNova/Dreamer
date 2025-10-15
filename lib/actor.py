@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 
+from lib.utils import log_unimix
 from lib.world_model import WorldModelState
 
 
@@ -51,10 +52,12 @@ class Actor(nn.Module):
             hidden: int = 512,
             depth: int = 2,
             ret_norm_limit: float = 1.0,
-            ret_norm_decay: float = 0.99
+            ret_norm_decay: float = 0.99,
+            unimix_eps: float = 0.01,
     ):
         super(Actor, self).__init__()
         self.entropy_scale = entropy_scale
+        self.unimix_eps = unimix_eps
 
         layers = []
         dim = state_size
@@ -96,7 +99,9 @@ class Actor(nn.Module):
         else:
             x = self.mlp(x)
             logits = self.head(x)
-        return torch.distributions.Categorical(logits=logits)
+
+        mixed_log_probs = log_unimix(logits, self.unimix_eps, dim=-1)
+        return torch.distributions.Categorical(logits=mixed_log_probs)
 
     def loss(
             self,
