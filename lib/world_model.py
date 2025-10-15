@@ -9,6 +9,8 @@ from torch import Tensor
 from lib.utils import symlog
 
 
+# TODO: Add unimixing option for categorical latents in encoder and dynamics predictor
+
 @dataclass
 class WorldModelState:
     h: torch.Tensor  # (B, h_dim)
@@ -404,6 +406,7 @@ class WorldModel(nn.Module):
             state_prev: WorldModelState,
             a_prev_idx: torch.Tensor,  # (B,)
             x_t: Optional[torch.Tensor] = None,  # (B,C,H,W) or None for imagination
+            c_prev: Optional[torch.Tensor] = None,  # (B,1) or None either 0 or 1
     ) -> Tuple[WorldModelState, Dict[str, Any]]:
         """
         One RSSM step.
@@ -411,6 +414,13 @@ class WorldModel(nn.Module):
         Returns new state and a dict with heads + logits for losses.
         """
         h_prev, z_prev = state_prev.h, state_prev.z
+
+        if c_prev is not None:
+            # reset carry-over across episode boundaries
+            mask_h = c_prev  # (B,1)
+            mask_z = c_prev.view(-1, 1, 1)  # (B,1,1) to broadcast over (L,K)
+            h_prev = h_prev * mask_h
+            z_prev = z_prev * mask_z
 
         # The sequence model updates the recurrent state h_t
         h = self.seq(h_prev, z_prev, a_prev_idx)  # (B, h_dim)
@@ -464,27 +474,30 @@ class WorldModel(nn.Module):
 
     def _prediction_loss(
             self,
-            x_true: torch.Tensor,
-            x_hat: torch.Tensor,
-            r_true: torch.Tensor,
-            r_hat: torch.Tensor,
-            c_true: torch.Tensor,
-            c_hat: torch.Tensor,
+            x_true: torch.Tensor,  # (B,C,H,W)
+            x_hat: torch.Tensor,  # (B,C,H,W)
+            r_true: torch.Tensor,  # (B,1)
+            r_hat: torch.Tensor,  # (B,1)
+            c_true: torch.Tensor,  # (B,1) {0, 1}
+            c_hat: torch.Tensor,  # (B,1)
     ) -> torch.Tensor:
         """
         The prediction loss trains the decoder and reward predictor via the symlog loss
         and the continue predictor via binary classification loss.
         """
+        # MSE loss in symlog space for image and reward
+        # (mean over C,H,W for image, mean over 1 for reward)
         img_loss = self._mse_symlog(x_hat, x_true, reduce_over=(1, 2, 3))
         rew_loss = self._mse_symlog(r_hat, r_true, reduce_over=(-1,))
+
         cont_loss = F.binary_cross_entropy_with_logits(c_hat, c_true, reduction="none").squeeze(-1)
 
         return img_loss + rew_loss + cont_loss
 
     def _dynamics_loss(
             self,
-            post_logits: torch.Tensor,
-            prior_logits: torch.Tensor,
+            post_logits: torch.Tensor,  # (B,L,K)
+            prior_logits: torch.Tensor,  # (B,L,K)
     ) -> torch.Tensor:
         """
         The dynamics loss trains the sequence model to predict the next representation
@@ -498,8 +511,8 @@ class WorldModel(nn.Module):
 
     def _representation_loss(
             self,
-            post_logits: torch.Tensor,
-            prior_logits: torch.Tensor,
+            post_logits: torch.Tensor,  # (B,L,K)
+            prior_logits: torch.Tensor,  # (B,L,K)
     ) -> torch.Tensor:
         """
         The representation loss trains the representations to become more predictable if the dynamics
@@ -516,8 +529,8 @@ class WorldModel(nn.Module):
             self,
             obs: torch.Tensor,  # (B,T,C,H,W)
             actions: torch.Tensor,  # (B,T) action indices
-            rewards: torch.Tensor,  # (B,T,1)
-            continues: torch.Tensor,  # (B,T,1) {0, 1}
+            rewards: torch.Tensor,  # (B,T)
+            continues: torch.Tensor,  # (B,T) {0, 1}
             init_state: Optional[WorldModelState] = None,
     ) -> tuple[Tensor, dict[str, Tensor]]:
         """
@@ -527,9 +540,29 @@ class WorldModel(nn.Module):
         B, T = obs.size(0), obs.size(1)
         device = obs.device
 
+        # -------------------
+        # TODO: set action to 0 where continue is 0 (maybe handle it in the sequence forward function instead)
+        # a_onehot = F.one_hot(a_prev_idx, num_classes=self.num_actions).float()  # (B,A)
+        # if c_prev is not None:
+        #     a_onehot = a_onehot * c_prev  # (B,1) -> zero vector when starting new episode
+        # z_flat = z_prev.reshape(z_prev.size(0), -1)
+        # x = torch.cat([h_prev, z_flat, a_onehot], dim=-1)
+        # x = self.input_layer(x)
+        # return self.rnn(x, h_prev)
+        # -------------------
+
         # prev actions a_{t-1}: left-shift, inject 0 for t=0
         a_prev = torch.zeros(B, T, dtype=torch.long, device=device)
         a_prev[:, 1:] = actions[:, :-1]
+
+        # Add dim for rewards to be (B,T,1)
+        rewards = rewards.unsqueeze(-1)
+
+        # Add dim for continues to be (B,T,1)
+        continues = continues.float().unsqueeze(-1)
+
+        # At t=0 there is no boundary
+        c_prev = torch.ones(B, 1, device=obs.device)
 
         state = init_state if init_state is not None else self.init_state(B, device=device, dtype=obs.dtype)
 
@@ -542,16 +575,17 @@ class WorldModel(nn.Module):
             state, info = self.step(
                 state_prev=state,
                 a_prev_idx=a_prev[:, t],
-                x_t=obs[:, t]
+                x_t=obs[:, t],
+                c_prev=c_prev,
             )
 
             # prediction loss
             pred_loss = self._prediction_loss(
                 x_true=obs[:, t],  # (B,C,H,W)
                 x_hat=info["x_hat"],  # (B,C,H,W)
-                r_true=rewards[:, t].unsqueeze(-1),  # (B,1)
+                r_true=rewards[:, t],  # (B,1)
                 r_hat=info["r_hat"],  # (B,1)
-                c_true=continues[:, t].float().unsqueeze(-1),  # (B,1)
+                c_true=continues[:, t],  # (B,1)
                 c_hat=info["c_hat"],  # (B,1)
             )
             pred_losses.append(pred_loss)
@@ -569,6 +603,9 @@ class WorldModel(nn.Module):
                 prior_logits=info["prior_logits"],
             )
             rep_losses.append(rep_loss)
+
+            # continue flag for next step
+            c_prev = continues[:, t]
 
         # Stack losses over time -> (T,B), then mean over time and batch -> (1,)
         pred = torch.stack(pred_losses, dim=0).mean()
