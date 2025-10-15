@@ -126,7 +126,8 @@ def train(cfg: Config, summary_writer=None):
             model_state = world_model.init_state(1, cfg.device)
             last_action_idx.zero_()
 
-        if len(buffer) > max(cfg.batch_size, cfg.batch_length):
+        # --- When enough data collected, update the models ---
+        if len(buffer) > cfg.batch_size * cfg.batch_length:
             # --- train the world model ---
             batch = buffer.sample(cfg.batch_size)
             obs = batch["observations"]

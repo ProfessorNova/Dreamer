@@ -58,7 +58,7 @@ class Config:
     run_dir: str = os.path.join("runs", datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S"))
     checkpoint_dir: str = os.path.join(run_dir, "checkpoints")
     log_interval: int = 10
-    video_interval: int = 100
+    video_interval: int = 1000
     video_fps: int = 20
     video_max_frames: int = 1000
 
