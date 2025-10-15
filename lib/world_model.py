@@ -5,16 +5,25 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
+from torch.distributions import Categorical, kl_divergence
 
 from lib.utils import symlog
 
-
-# TODO: Add unimixing option for categorical latents in encoder and dynamics predictor
 
 @dataclass
 class WorldModelState:
     h: torch.Tensor  # (B, h_dim)
     z: torch.Tensor  # (B, num_latents, classes_per_latent)
+
+
+def log_unimix(logits: torch.Tensor, eps: float, dim: int = -1) -> torch.Tensor:
+    """
+    Returns log of the mixed probabilities, same shape as logits.
+    """
+    probs = logits.softmax(dim=dim)
+    K = logits.size(dim)
+    probs = (1.0 - eps) * probs + eps / float(K)
+    return probs.clamp_min(1e-8).log()
 
 
 class SequenceModel(nn.Module):
@@ -322,6 +331,7 @@ class WorldModel(nn.Module):
             beta_pred: float = 1.0,
             beta_dyn: float = 0.5,
             beta_rep: float = 0.1,
+            unimix_eps: float = 0.01,
     ):
         super().__init__()
         self.obs_shape = obs_shape
@@ -333,6 +343,7 @@ class WorldModel(nn.Module):
         self.beta_pred = beta_pred
         self.beta_dyn = beta_dyn
         self.beta_rep = beta_rep
+        self.unimix_eps = unimix_eps
 
         self.seq = SequenceModel(
             action_size=action_size,
@@ -392,20 +403,15 @@ class WorldModel(nn.Module):
             (batch_size, self.num_latents, self.classes_per_latent),
             1.0 / self.classes_per_latent,
             device=device,
-            dtype=dtype if dtype is not None else torch.float32,
+            dtype=dtype,
         )
         return WorldModelState(h=h0, z=z0)
-
-    @staticmethod
-    def _sample_z(logits: torch.Tensor) -> torch.Tensor:
-        # Straight-through Gumbel-Softmax per latent category
-        return F.gumbel_softmax(logits, tau=1.0, hard=True, dim=-1)
 
     def step(
             self,
             state_prev: WorldModelState,
             a_prev_idx: torch.Tensor,  # (B,)
-            x_t: Optional[torch.Tensor] = None,  # (B,C,H,W) or None for imagination
+            x_cur: Optional[torch.Tensor] = None,  # (B,C,H,W) or None for imagination
             c_prev: Optional[torch.Tensor] = None,  # (B,1) or None either 0 or 1
     ) -> Tuple[WorldModelState, Dict[str, Any]]:
         """
@@ -423,32 +429,32 @@ class WorldModel(nn.Module):
             z_prev = z_prev * mask_z
 
         # The sequence model updates the recurrent state h_t
-        h = self.seq(h_prev, z_prev, a_prev_idx)  # (B, h_dim)
+        h_cur = self.seq(h_prev, z_prev, a_prev_idx)  # (B, h_dim)
 
         # The encoder maps sensory input x_t to posterior logits
-        z_logits_post = self.enc(x_t, h) if x_t is not None else None  # (B, L, K) or None
+        z_logits_post = self.enc(x_cur, h_cur) if x_cur is not None else None  # (B, L, K) or None
 
         # The dynamics predictor predicts prior logits from h_t
-        z_logits_prior = self.dyn(h)  # (B, L, K)
+        z_logits_prior = self.dyn(h_cur)  # (B, L, K)
 
         # The logits for z_t are from the encoder if available, else from the dynamics predictor
         z_logits = z_logits_post if z_logits_post is not None else z_logits_prior  # (B, L, K)
 
-        # Sample z_t (straight-through)
-        z = self._sample_z(z_logits)  # (B, L, K)
+        # Sample z_t
+        z = self._sample_z(z_logits, hard=True)  # (B, L, K)
 
         # Heads (reconstruction, reward, continue)
-        x_hat = self.dec(h, z)  # (B,C,H,W)
-        r_hat = self.rew(h, z)  # (B,1)
-        c_hat = self.cont(h, z)  # (B,1)
+        r_hat = self.rew(h_cur, z)  # (B,1)
+        c_hat = self.cont(h_cur, z)  # (B,1)
+        x_hat = self.dec(h_cur, z)  # (B,C,H,W)
 
-        new_state = WorldModelState(h=h, z=z)
+        new_state = WorldModelState(h=h_cur, z=z)
         info: Dict[str, Any] = {
             "prior_logits": z_logits_prior,
             "post_logits": z_logits_post,  # None in imagination
-            "x_hat": x_hat,  # (B,C,H,W) in symlog space
             "r_hat": r_hat,  # (B,1) in symlog space
-            "c_hat": c_hat,
+            "c_hat": c_hat,  # (B,1) logits
+            "x_hat": x_hat,  # (B,C,H,W) in symlog space
         }
         return new_state, info
 
@@ -460,16 +466,27 @@ class WorldModel(nn.Module):
         se = (pred - symlog(target)) ** 2
         return 0.5 * se.mean(dim=reduce_over)
 
-    @staticmethod
-    def _kl_categorical_logits(q_logits: torch.Tensor, p_logits: torch.Tensor) -> torch.Tensor:
+    def _sample_z(self, logits: torch.Tensor, hard: bool = True) -> torch.Tensor:
+        log_prob = log_unimix(logits, self.unimix_eps, dim=-1)  # log of mixed probs
+        return F.gumbel_softmax(log_prob, hard=hard, dim=-1)
+
+    def _kl_categorical_logits(self, q_logits: torch.Tensor, p_logits: torch.Tensor) -> torch.Tensor:
         """
-        KL[ q || p ] for factorized categoricals over (L,K), summed over K and L -> (B,)
+        KL[ q || p ] for factorized categoricals over (L,K), using unimix on both.
+        Sum over K and L -> (B,).
         """
-        log_q = F.log_softmax(q_logits, dim=-1)  # (B,L,K)
-        log_p = F.log_softmax(p_logits, dim=-1)  # (B,L,K)
-        q = log_q.exp()
-        kl = (q * (log_q - log_p)).sum(dim=-1)  # sum over K -> (B,L)
-        kl = kl.sum(dim=-1)  # sum over L -> (B,)
+        K = q_logits.size(-1)
+
+        # Unimix both sides: (1 - eps)*softmax + eps/K
+        q_probs = (1.0 - self.unimix_eps) * F.softmax(q_logits, dim=-1) + self.unimix_eps / float(K)
+        p_probs = (1.0 - self.unimix_eps) * F.softmax(p_logits, dim=-1) + self.unimix_eps / float(K)
+
+        # Build distributions; shapes broadcast over (B, L)
+        q = Categorical(probs=q_probs)
+        p = Categorical(probs=p_probs)
+
+        # KL per (B, L), then sum over L
+        kl = kl_divergence(q, p).sum(dim=-1)  # -> (B,)
         return kl
 
     def _prediction_loss(
@@ -487,9 +504,10 @@ class WorldModel(nn.Module):
         """
         # MSE loss in symlog space for image and reward
         # (mean over C,H,W for image, mean over 1 for reward)
-        img_loss = self._mse_symlog(x_hat, x_true, reduce_over=(1, 2, 3))
+        img_loss = self._mse_symlog(x_hat, x_true, reduce_over=(-3, -2, -1))
         rew_loss = self._mse_symlog(r_hat, r_true, reduce_over=(-1,))
 
+        # Binary cross-entropy loss for continue flag
         cont_loss = F.binary_cross_entropy_with_logits(c_hat, c_true, reduction="none").squeeze(-1)
 
         return img_loss + rew_loss + cont_loss
@@ -503,9 +521,9 @@ class WorldModel(nn.Module):
         The dynamics loss trains the sequence model to predict the next representation
         by minimizing the KL divergence between the predictor and the next stochastic representation.
         """
-        post_logits = post_logits.detach()  # stop gradient to the encoder
+        post_logits_detached = post_logits.detach()  # stop gradient to the encoder
 
-        kl = self._kl_categorical_logits(post_logits, prior_logits)
+        kl = self._kl_categorical_logits(post_logits_detached, prior_logits)
         kl = torch.clamp(kl, min=self.free_bits)  # free bits
         return kl
 
@@ -519,9 +537,9 @@ class WorldModel(nn.Module):
         cannot predict their distribution, allowing us to use a factorized dynamics predictor for fast sampling
         when training the actor and critic.
         """
-        prior_logits = prior_logits.detach()  # stop gradient to the dynamics predictor
+        prior_logits_detached = prior_logits.detach()  # stop gradient to the dynamics predictor
 
-        kl = self._kl_categorical_logits(post_logits, prior_logits)
+        kl = self._kl_categorical_logits(post_logits, prior_logits_detached)
         kl = torch.clamp(kl, min=self.free_bits)  # free bits
         return kl
 
@@ -538,7 +556,6 @@ class WorldModel(nn.Module):
         Returns (total_loss, metrics_dict).
         """
         B, T = obs.size(0), obs.size(1)
-        device = obs.device
 
         # -------------------
         # TODO: set action to 0 where continue is 0 (maybe handle it in the sequence forward function instead)
@@ -552,7 +569,7 @@ class WorldModel(nn.Module):
         # -------------------
 
         # prev actions a_{t-1}: left-shift, inject 0 for t=0
-        a_prev = torch.zeros(B, T, dtype=torch.long, device=device)
+        a_prev = torch.zeros(B, T, dtype=torch.long, device=obs.device)
         a_prev[:, 1:] = actions[:, :-1]
 
         # Add dim for rewards to be (B,T,1)
@@ -564,7 +581,7 @@ class WorldModel(nn.Module):
         # At t=0 there is no boundary
         c_prev = torch.ones(B, 1, device=obs.device)
 
-        state = init_state if init_state is not None else self.init_state(B, device=device, dtype=obs.dtype)
+        state = init_state if init_state is not None else self.init_state(B, device=obs.device, dtype=obs.dtype)
 
         pred_losses = []
         dyn_losses = []
@@ -575,7 +592,7 @@ class WorldModel(nn.Module):
             state, info = self.step(
                 state_prev=state,
                 a_prev_idx=a_prev[:, t],
-                x_t=obs[:, t],
+                x_cur=obs[:, t],
                 c_prev=c_prev,
             )
 

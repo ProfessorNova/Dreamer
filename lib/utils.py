@@ -67,7 +67,7 @@ def log_episode_video(
 
         # Update posterior state with the *real* obs and last action
         obs_tensor = torch.as_tensor(current_obs, dtype=torch.float32, device=cfg.device).unsqueeze(0) / 255.0
-        model_state, _ = world_model.step(model_state, a_prev_idx=last_action_idx, x_t=obs_tensor)
+        model_state, _ = world_model.step(model_state, a_prev_idx=last_action_idx, x_cur=obs_tensor)
 
         # Sample action from actor
         dist = actor(model_state)
@@ -112,7 +112,6 @@ def log_wm_reconstruction_video(
         world_model,
         actor,
         global_step: int,
-        max_frames: int | None = None,
 ) -> None:
     """
     Posterior reconstructions vs ground truth:
@@ -120,9 +119,6 @@ def log_wm_reconstruction_video(
       - at each step, feed x_t to encoder (posterior) and decode x_hat
       - log side-by-side (GT | Recon)
     """
-    if max_frames is None:
-        max_frames = cfg.video_max_frames
-
     # Collect short rollout with actions & ground-truth frames
     obs_seq, act_seq = [], []
     done = False
@@ -133,11 +129,11 @@ def log_wm_reconstruction_video(
     model_state = world_model.init_state(1, cfg.device)
     last_action_idx = torch.zeros(1, dtype=torch.long, device=cfg.device)
 
-    while not done and steps < max_frames:
+    while not done and steps < cfg.video_max_frames:
         obs_seq.append(current_obs)  # HWC uint8
 
         obs_tensor = torch.as_tensor(current_obs, dtype=torch.float32, device=cfg.device).unsqueeze(0) / 255.0
-        model_state, _ = world_model.step(model_state, a_prev_idx=last_action_idx, x_t=obs_tensor)
+        model_state, _ = world_model.step(model_state, a_prev_idx=last_action_idx, x_cur=obs_tensor)
 
         dist = actor(model_state)
         a = dist.sample().item()
@@ -159,8 +155,7 @@ def log_wm_reconstruction_video(
     for t in range(len(obs_seq)):
         x_t = torch.as_tensor(obs_seq[t], dtype=torch.float32, device=cfg.device).unsqueeze(0) / 255.0
 
-        model_state, info = world_model.step(model_state, a_prev_idx=last_action_idx, x_t=x_t)
-        # x_hat is in symlog space in your training; map to pixel space
+        model_state, info = world_model.step(model_state, a_prev_idx=last_action_idx, x_cur=x_t)
         x_recon = symexp(info["x_hat"]).clamp(0.0, 1.0)  # (B,C,H,W)
         recon = (x_recon[0].permute(1, 2, 0).cpu().numpy() * 255.0).astype(np.uint8)
 
@@ -181,7 +176,6 @@ def log_wm_imagination_video(
         world_model,
         actor,
         global_step: int,
-        max_frames: int | None = None,
 ) -> None:
     """
     Prior imagination vs ground truth:
@@ -191,9 +185,6 @@ def log_wm_imagination_video(
         and decode imagined frames to compare with GT.
       - log side-by-side (GT | Imagine)
     """
-    if max_frames is None:
-        max_frames = cfg.video_max_frames
-
     # Collect GT sequence + actions with actor
     obs_seq, act_seq = [], []
     done = False
@@ -204,11 +195,11 @@ def log_wm_imagination_video(
     model_state = world_model.init_state(1, cfg.device)
     last_action_idx = torch.zeros(1, dtype=torch.long, device=cfg.device)
 
-    while not done and steps < max_frames:
+    while not done and steps < cfg.video_max_frames:
         obs_seq.append(current_obs)
 
         obs_tensor = torch.as_tensor(current_obs, dtype=torch.float32, device=cfg.device).unsqueeze(0) / 255.0
-        model_state, _ = world_model.step(model_state, a_prev_idx=last_action_idx, x_t=obs_tensor)
+        model_state, _ = world_model.step(model_state, a_prev_idx=last_action_idx, x_cur=obs_tensor)
 
         dist = actor(model_state)
         a = dist.sample().item()
@@ -230,7 +221,7 @@ def log_wm_imagination_video(
 
     # t = 0: posterior update for alignment (decode too for completeness)
     x0 = torch.as_tensor(obs_seq[0], dtype=torch.float32, device=cfg.device).unsqueeze(0) / 255.0
-    model_state, info0 = world_model.step(model_state, a_prev_idx=last_action_idx, x_t=x0)
+    model_state, info0 = world_model.step(model_state, a_prev_idx=last_action_idx, x_cur=x0)
     xhat0 = symexp(info0["x_hat"]).clamp(0.0, 1.0)
     img0 = (xhat0[0].permute(1, 2, 0).cpu().numpy() * 255.0).astype(np.uint8)
     gt = np.transpose(obs_seq[0], (1, 2, 0))  # to HWC
@@ -239,9 +230,9 @@ def log_wm_imagination_video(
 
     # t >= 1: prior imagination using recorded actions
     for t in range(1, len(obs_seq)):
-        # prior step: no x_t
+        # prior step: no x_cur
         model_state, info = world_model.step(model_state, a_prev_idx=torch.tensor([act_seq[t - 1]], device=cfg.device),
-                                             x_t=None)
+                                             x_cur=None)
         x_im = symexp(info["x_hat"]).clamp(0.0, 1.0)
         im = (x_im[0].permute(1, 2, 0).cpu().numpy() * 255.0).astype(np.uint8)
 

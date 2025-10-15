@@ -38,6 +38,7 @@ def train(cfg: Config, summary_writer=None):
         beta_pred=cfg.beta_pred,
         beta_dyn=cfg.beta_dyn,
         beta_rep=cfg.beta_rep,
+        unimix_eps=cfg.unimix_eps
     ).to(cfg.device)
     model_state_size = cfg.gru_recurrent_units + cfg.num_latents * cfg.classes_per_latent
 
@@ -85,6 +86,9 @@ def train(cfg: Config, summary_writer=None):
     time_counter = time.time()
     iter_counter = 0
 
+    # how many env steps per training iteration based on batch size/length
+    env_steps_per_iteration = (cfg.batch_size * cfg.batch_length) // cfg.train_ratio
+
     world_model_loss = None
     actor_loss = None
     critic_loss = None
@@ -94,44 +98,45 @@ def train(cfg: Config, summary_writer=None):
 
     current_obs = None
     for it in range(cfg.num_iterations):
-        # --- Collect a single transition ---
-        if current_obs is None:
-            obs, _ = env.reset()
-            current_obs = obs
-        # Sample action using actor on current world model state
-        with torch.no_grad():
-            # Update model state with latest observation embedding and last action
-            obs_tensor = torch.tensor(current_obs, dtype=torch.float32, device=cfg.device).unsqueeze(0) / 255.0
-            model_state, _ = world_model.step(model_state, last_action_idx, obs_tensor)
-            dist = actor(model_state)
-            action_idx = dist.sample().item()
+        for env_step in range(env_steps_per_iteration):
+            # --- Collect a single transition ---
+            if current_obs is None:
+                obs, _ = env.reset()
+                current_obs = obs
+            # Sample action using actor on current world model state
+            with torch.no_grad():
+                # Update model state with latest observation embedding and last action
+                obs_tensor = torch.tensor(current_obs, dtype=torch.float32, device=cfg.device).unsqueeze(0) / 255.0
+                model_state, _ = world_model.step(model_state, last_action_idx, obs_tensor)
+                dist = actor(model_state)
+                action_idx = dist.sample().item()
 
-            # log real-env policy stats
-            if summary_writer is not None and it % cfg.log_interval == 0 and it > 0:
-                ent_env = dist.entropy().mean().item()
-                summary_writer.add_scalar("policy/env_entropy", ent_env, it)
-                summary_writer.add_histogram("policy/env_probs", dist.probs, it)
+                # log real-env policy stats
+                if summary_writer is not None and it % cfg.log_interval == 0 and it > 0 and env_step == 0:
+                    ent_env = dist.entropy().mean().item()
+                    summary_writer.add_scalar("policy/env_entropy", ent_env, it)
+                    summary_writer.add_histogram("policy/env_probs", dist.probs, it)
 
-        # interact with environment
-        next_obs, reward, terminated, truncated, _ = env.step(action_idx)
-        cont = not (terminated or truncated)
+            # interact with environment
+            next_obs, reward, terminated, truncated, _ = env.step(action_idx)
+            cont = not (terminated or truncated)
 
-        buffer.store(current_obs, action_idx, float(reward), cont)
+            buffer.store(current_obs, action_idx, float(reward), cont)
 
-        current_obs = next_obs
-        last_action_idx.fill_(action_idx)
+            current_obs = next_obs
+            last_action_idx.fill_(action_idx)
 
-        if not cont:
-            current_obs, _ = env.reset()
-            model_state = world_model.init_state(1, cfg.device)
-            last_action_idx.zero_()
+            if not cont:
+                current_obs, _ = env.reset()
+                model_state = world_model.init_state(1, cfg.device)
+                last_action_idx.zero_()
 
         # --- When enough data collected, update the models ---
         if len(buffer) > cfg.batch_size * cfg.batch_length:
             # --- train the world model ---
             batch = buffer.sample(cfg.batch_size)
             obs = batch["observations"]
-            obs = obs.float() / 255.0  # scale to [0,1]
+            obs = obs.float() / 255.0
             actions = batch["actions"]
             rewards = batch["rewards"]
             continues = batch["continues"]
@@ -261,7 +266,7 @@ def train(cfg: Config, summary_writer=None):
                     summary_writer.add_scalar("train/critic_loss", critic_loss.item(), it)
 
         # Periodic evaluation video
-        if it % cfg.video_interval == 0 and it > 0 and summary_writer is not None:
+        if it % cfg.video_interval == 0 and it > 0 and summary_writer is not None and world_model_loss is not None:
             world_model.eval()
             actor.eval()
             log_episode_video(cfg, summary_writer, env, world_model, actor, it)
