@@ -5,7 +5,6 @@ from lib.utils import log_unimix
 from lib.world_model import WorldModelState
 
 
-# TODO: Make p5 and p95 buffers adjustable
 class EMAPercentileScale(nn.Module):
     def __init__(self, decay: float = 0.99, min_scale: float = 1.0):
         super().__init__()
@@ -15,13 +14,13 @@ class EMAPercentileScale(nn.Module):
         self.register_buffer("p95", torch.tensor(1.0))
         self._init = False
 
-    def update_get_scale(self, x: torch.Tensor) -> torch.Tensor:
+    def update_get_S(self, x: torch.Tensor) -> torch.Tensor:
         x = x.detach().reshape(-1).float()
         if x.numel() == 0:
-            span = (self.p95 - self.p5).clamp_min(self.min_scale)
-            return span
+            return x.new_tensor(1.0)
         q05 = torch.quantile(x, 0.05)
         q95 = torch.quantile(x, 0.95)
+        # ensure non-degenerate span
         q95 = torch.maximum(q95, q05 + x.new_tensor(1e-8))
         if self.training:
             if not self._init:
@@ -32,7 +31,8 @@ class EMAPercentileScale(nn.Module):
                 d = 1.0 - self.decay
                 self.p5.mul_(self.decay).add_(d * q05)
                 self.p95.mul_(self.decay).add_(d * q95)
-        return (self.p95 - self.p5).clamp_min(self.min_scale)
+        S = (self.p95 - self.p5)
+        return torch.maximum(S, x.new_tensor(self.min_scale))  # max(1, S)
 
 
 class Actor(nn.Module):
@@ -69,7 +69,7 @@ class Actor(nn.Module):
         self.mlp = nn.Sequential(*layers)
         self.head = nn.Linear(hidden, action_size)
 
-        self.adv_norm = EMAPercentileScale(decay=ret_norm_decay, min_scale=ret_norm_limit)
+        self.ret_scale = EMAPercentileScale(decay=ret_norm_decay, min_scale=ret_norm_limit)
 
     @staticmethod
     def _state_vec(s: WorldModelState) -> torch.Tensor:
@@ -108,16 +108,14 @@ class Actor(nn.Module):
             model_states: WorldModelState,
             actions: torch.Tensor,  # (B,) or (B,T) long indices
             returns: torch.Tensor,  # (B,) or (B,T) lambda-returns
-            values: torch.Tensor  # (B,) or (B,T) predicted values
     ) -> torch.Tensor:
-        action_dist = self(model_states)
-        log_probs = action_dist.log_prob(actions)
-        entropy = action_dist.entropy().mean()
+        dist = self(model_states)
+        log_probs = dist.log_prob(actions)
 
-        advantages = returns - values
-        scale = self.adv_norm.update_get_scale(advantages)
-        advantages /= scale
+        S = self.ret_scale.update_get_S(returns)
+        target = returns / S
+        policy_loss = -(log_probs * target).mean()
 
-        policy_loss = -(log_probs * advantages).mean()
+        entropy = dist.entropy().mean()
         loss = policy_loss - self.entropy_scale * entropy
         return loss

@@ -57,7 +57,6 @@ class Critic(nn.Module):
         """
         Convert WorldModelState to a flat feature vector.
         Works for both single states (B,H) and sequences of states (B,T,H).
-        Also stops gradients to the world model.
         """
         h, z = s.h, s.z
         # Support (B,H) or (B,T,H)

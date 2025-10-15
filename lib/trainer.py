@@ -1,3 +1,4 @@
+import os
 import time
 
 import gymnasium as gym
@@ -89,6 +90,7 @@ def train(cfg: Config, summary_writer=None):
 
     # how many env steps per training iteration based on batch size/length
     env_steps_per_iteration = (cfg.batch_size * cfg.batch_length) // cfg.train_ratio
+    print(f"Doing {env_steps_per_iteration} env steps per training iteration.")
 
     world_model_loss = None
     actor_loss = None
@@ -149,6 +151,7 @@ def train(cfg: Config, summary_writer=None):
             nn.utils.clip_grad_norm_(world_model.parameters(), cfg.world_model_grad_clip)
             optim_world_model.step()
 
+            # --- train actor and critic using in imagination ---
             with torch.no_grad():
                 # Recycle the model state from the world model training
                 start_state: WorldModelState = world_model_tensor_dict["state"]
@@ -213,13 +216,10 @@ def train(cfg: Config, summary_writer=None):
             critic.update_slow()
 
             # ---- Actor update ----
-            with torch.no_grad():
-                vals_for_actor = critic.value(Hs)  # (B,H)
             actor_loss = actor.loss(
                 model_states=Hs,
                 actions=A.detach(),  # (B,H)
                 returns=lam_returns.detach(),  # (B,H)
-                values=vals_for_actor.detach(),  # (B,H)
             )
             optim_actor.zero_grad()
             actor_loss.backward()
@@ -228,25 +228,29 @@ def train(cfg: Config, summary_writer=None):
 
             # ---- Rich logging ----
             if summary_writer is not None and it % cfg.log_interval == 0 and it > 0:
-                # Aggregate imagination policy stats
-                ent_im = torch.stack([d.entropy().mean() for d in imagination_dists]).mean().item()
-                dist_im = imagination_dists[-1]
-                vals_vec = V.reshape(-1)
-                rew_vec = R.reshape(-1)
-                cont_vec = C.reshape(-1)
-                adv_vec = (lam_returns - vals_for_actor).reshape(-1)
+                with torch.no_grad():
+                    # Aggregate imagination policy stats
+                    ent_im = torch.stack([d.entropy().mean() for d in imagination_dists]).mean().item()
+                    dist_im = imagination_dists[-1]
+                    vals_vec = V.reshape(-1)
+                    rew_vec = R.reshape(-1)
+                    cont_vec = C.reshape(-1)
+                    S_cur = torch.clamp(actor.ret_scale.p95 - actor.ret_scale.p5,
+                                        min=torch.tensor(1.0, device=cfg.device))
+                    target = (lam_returns.detach() / S_cur).reshape(-1)
 
-                summary_writer.add_scalar("policy/imag_entropy", ent_im, it)
-                summary_writer.add_histogram("policy/imag_probs", dist_im.probs, it)
-                summary_writer.add_scalar("value/mean", vals_vec.mean().item(), it)
-                summary_writer.add_scalar("value/std", vals_vec.std(unbiased=False).item(), it)
-                summary_writer.add_scalar("returns/lambda_mean", lam_returns.mean().item(), it)
-                summary_writer.add_scalar("returns/lambda_std", lam_returns.std(unbiased=False).item(), it)
-                summary_writer.add_scalar("adv/mean", adv_vec.mean().item(), it)
-                summary_writer.add_scalar("adv/std", adv_vec.std(unbiased=False).item(), it)
-                summary_writer.add_scalar("reward_pred/mean", rew_vec.mean().item(), it)
-                summary_writer.add_scalar("reward_pred/std", rew_vec.std(unbiased=False).item(), it)
-                summary_writer.add_scalar("continue_pred/mean", cont_vec.mean().item(), it)
+                    summary_writer.add_scalar("actor/ret_scale", S_cur.item(), it)
+                    summary_writer.add_scalar("actor/target_mean", target.mean().item(), it)
+                    summary_writer.add_scalar("actor/target_std", target.std(unbiased=False).item(), it)
+                    summary_writer.add_scalar("policy/imag_entropy", ent_im, it)
+                    summary_writer.add_histogram("policy/imag_probs", dist_im.probs, it)
+                    summary_writer.add_scalar("value/mean", vals_vec.mean().item(), it)
+                    summary_writer.add_scalar("value/std", vals_vec.std(unbiased=False).item(), it)
+                    summary_writer.add_scalar("returns/lambda_mean", lam_returns.mean().item(), it)
+                    summary_writer.add_scalar("returns/lambda_std", lam_returns.std(unbiased=False).item(), it)
+                    summary_writer.add_scalar("reward_pred/mean", rew_vec.mean().item(), it)
+                    summary_writer.add_scalar("reward_pred/std", rew_vec.std(unbiased=False).item(), it)
+                    summary_writer.add_scalar("continue_pred/mean", cont_vec.mean().item(), it)
 
         # ---- Console + scalar logs ----
         if it % cfg.log_interval == 0 and it > 0 and world_model_loss is not None:
@@ -275,6 +279,19 @@ def train(cfg: Config, summary_writer=None):
             log_wm_imagination_video(cfg, summary_writer, env, world_model, actor, it)
             world_model.train()
             actor.train()
+
+        # Save model
+        if it % cfg.save_interval == 0 and it > 0 and cfg.checkpoint_dir is not None and world_model_loss is not None:
+            torch.save({
+                "world_model": world_model.state_dict(),
+                "actor": actor.state_dict(),
+                "critic": critic.state_dict(),
+                "optim_world_model": optim_world_model.state_dict(),
+                "optim_actor": optim_actor.state_dict(),
+                "optim_critic": optim_critic.state_dict(),
+                "iteration": it,
+            }, os.path.join(cfg.checkpoint_dir, f"ckpt.pth"))
+            print(f"Saved model checkpoint to {cfg.checkpoint_dir}")
 
         iter_counter += 1
 

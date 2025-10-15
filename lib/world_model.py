@@ -116,6 +116,8 @@ class Encoder(nn.Module):
         """
         B = x_t.size(0)
         assert x_t.dim() == 4 and x_t.shape == (B, 3, 64, 64)
+
+        x_t = symlog(x_t)  # convert to symlog space to avoid large reconstruction gradients
         conv_out = self.conv(x_t)  # (B, conv_out)
         combined = torch.cat([conv_out, h_t], dim=-1)  # (B, conv_out + h_dim)
         logits = self.fc(combined).view(-1, self.num_latents, self.classes_per_latent)

@@ -34,14 +34,12 @@ class Config:
     # Actor Critic
     imagination_horizon: int = 15
     gamma: float = 0.997
-    discount_horizon: int = int(1 / (1 - gamma))
     lam: float = 0.95
     critic_num_buckets: int = 255
     critic_bucket_min: float = -20.0
     critic_bucket_max: float = 20.0
     critic_ema_decay: float = 0.98
     critic_ema_regularizer: float = 1.0
-    return_normalization_scale: float = (0.95, 0.05)
     return_normalization_limit: float = 1.0
     return_normalization_decay: float = 0.99
     actor_entropy_scale: float = 3e-4
@@ -60,7 +58,8 @@ class Config:
     run_dir: str = os.path.join("runs", datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S"))
     checkpoint_dir: str = os.path.join(run_dir, "checkpoints")
     log_interval: int = 10
-    video_interval: int = 100
+    save_interval: int = 1000
+    video_interval: int = 500
     video_fps: int = 20
     video_max_frames: int = 200
 
