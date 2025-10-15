@@ -229,25 +229,50 @@ def train(cfg: Config, summary_writer=None):
             # ---- Rich logging ----
             if summary_writer is not None and it % cfg.log_interval == 0 and it > 0:
                 with torch.no_grad():
-                    # Aggregate imagination policy stats
+                    # ---- Policy (imagination) ----
                     ent_im = torch.stack([d.entropy().mean() for d in imagination_dists]).mean().item()
                     dist_im = imagination_dists[-1]
+
                     vals_vec = V.reshape(-1)
                     rew_vec = R.reshape(-1)
                     cont_vec = C.reshape(-1)
-                    S_cur = torch.clamp(actor.ret_scale.p95 - actor.ret_scale.p5,
-                                        min=torch.tensor(1.0, device=cfg.device))
+                    ret_flat = lam_returns.reshape(-1)
+
+                    # Return scale (S = max(1, p95 - p05))
+                    # use inplace clamp to avoid creating new tensors
+                    S_raw = (actor.ret_scale.p95 - actor.ret_scale.p5).detach()
+                    S_cur = S_raw.clamp_min(1.0)
                     target = (lam_returns.detach() / S_cur).reshape(-1)
 
+                    # ---- Actor scaling ----
                     summary_writer.add_scalar("actor/ret_scale", S_cur.item(), it)
+                    summary_writer.add_scalar("actor/ret_scale_raw", S_raw.item(), it)
+                    summary_writer.add_scalar("actor/ret_p05", torch.quantile(ret_flat, 0.05).item(), it)
+                    summary_writer.add_scalar("actor/ret_p95", torch.quantile(ret_flat, 0.95).item(), it)
+                    summary_writer.add_scalar("actor/scale_clipped", float((S_cur <= 1.0).item()), it)
                     summary_writer.add_scalar("actor/target_mean", target.mean().item(), it)
                     summary_writer.add_scalar("actor/target_std", target.std(unbiased=False).item(), it)
                     summary_writer.add_scalar("policy/imag_entropy", ent_im, it)
                     summary_writer.add_histogram("policy/imag_probs", dist_im.probs, it)
+
+                    # ---- Critic diagnostics ----
+                    val_err = (lam_returns - V).reshape(-1)
+                    summary_writer.add_scalar("value/mae_vs_returns", val_err.abs().mean().item(), it)
+                    summary_writer.add_scalar("value/bias_vs_returns", val_err.mean().item(), it)
+
+                    # ---- Critic/value & return stats ----
                     summary_writer.add_scalar("value/mean", vals_vec.mean().item(), it)
                     summary_writer.add_scalar("value/std", vals_vec.std(unbiased=False).item(), it)
                     summary_writer.add_scalar("returns/lambda_mean", lam_returns.mean().item(), it)
                     summary_writer.add_scalar("returns/lambda_std", lam_returns.std(unbiased=False).item(), it)
+
+                    # ---- World model breakdown (from last WM update) ----
+                    wmd = world_model_tensor_dict
+                    summary_writer.add_scalar("wm/pred_loss", wmd["pred_loss"].item(), it)
+                    summary_writer.add_scalar("wm/dyn_kl", wmd["dyn_loss"].item(), it)
+                    summary_writer.add_scalar("wm/rep_kl", wmd["rep_loss"].item(), it)
+
+                    # ---- Heads (reward/continue) ----
                     summary_writer.add_scalar("reward_pred/mean", rew_vec.mean().item(), it)
                     summary_writer.add_scalar("reward_pred/std", rew_vec.std(unbiased=False).item(), it)
                     summary_writer.add_scalar("continue_pred/mean", cont_vec.mean().item(), it)
