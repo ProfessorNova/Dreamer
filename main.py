@@ -8,6 +8,7 @@ from tensorboardX import SummaryWriter
 from lib.config import Config
 from lib.trainer import train
 
+torch.backends.cudnn.benchmark = True
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 torch.set_float32_matmul_precision("high")

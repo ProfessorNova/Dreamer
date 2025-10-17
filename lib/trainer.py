@@ -29,33 +29,34 @@ def train(cfg: Config, summary_writer=None):
     world_model = WorldModel(
         obs_shape=obs_shape,
         action_size=act_size,
-        h_dim=cfg.gru_recurrent_units,
         num_latents=cfg.num_latents,
         classes_per_latent=cfg.classes_per_latent,
-        cnn_multiplier=cfg.cnn_multiplier,
-        hidden=cfg.dense_hidden_units,
-        depth=cfg.mlp_layers,
+        hidden_size=cfg.hidden_size,
+        base_cnn_channels=cfg.base_cnn_channels,
+        mlp_hidden_units=cfg.mlp_hidden_units,
         free_bits=cfg.free_bits,
         beta_pred=cfg.beta_pred,
         beta_dyn=cfg.beta_dyn,
         beta_rep=cfg.beta_rep,
         unimix_eps=cfg.unimix_eps
     ).to(cfg.device)
-    model_state_size = cfg.gru_recurrent_units + cfg.num_latents * cfg.classes_per_latent
+    model_state_size = cfg.hidden_size + cfg.num_latents * cfg.classes_per_latent
 
     actor = Actor(
         state_size=model_state_size,
         action_size=act_size,
+        mlp_hidden_units=cfg.mlp_hidden_units,
+        mlp_layers=2,
         entropy_scale=cfg.actor_entropy_scale,
-        hidden=cfg.dense_hidden_units,
-        depth=cfg.mlp_layers,
+        ret_norm_limit=cfg.actor_ret_norm_limit,
+        ret_norm_decay=cfg.actor_ret_norm_decay,
         unimix_eps=cfg.unimix_eps,
     ).to(cfg.device)
 
     critic = Critic(
         state_size=model_state_size,
-        hidden=cfg.dense_hidden_units,
-        depth=cfg.mlp_layers,
+        mlp_hidden_units=cfg.mlp_hidden_units,
+        mlp_layers=2,
         num_buckets=cfg.critic_num_buckets,
         bucket_min=cfg.critic_bucket_min,
         bucket_max=cfg.critic_bucket_max,
@@ -67,9 +68,17 @@ def train(cfg: Config, summary_writer=None):
     def count_params(model):
         return sum(p.numel() for p in model.parameters())
 
+    def count_learnable_params(model):
+        return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
     print(f"World Model parameters: {count_params(world_model):,}")
     print(f"Actor parameters: {count_params(actor):,}")
     print(f"Critic parameters: {count_params(critic):,}")
+
+    print(f"Total parameters: {count_params(world_model) + count_params(actor) + count_params(critic):,}")
+    print(
+        f"Total learnable parameters: {count_learnable_params(world_model) + count_learnable_params(actor) + count_learnable_params(critic):,}"
+    )
 
     # --- Replay Buffer ---
     buffer = ReplayBuffer(
@@ -80,17 +89,25 @@ def train(cfg: Config, summary_writer=None):
     )
 
     # --- Optimizers ---
-    optim_world_model = torch.optim.Adam(world_model.parameters(), lr=cfg.world_model_lr, eps=cfg.world_model_adam_eps)
-    optim_actor = torch.optim.Adam(actor.parameters(), lr=cfg.actor_critic_lr, eps=cfg.actor_critic_adam_eps)
-    optim_critic = torch.optim.Adam(critic.parameters(), lr=cfg.actor_critic_lr, eps=cfg.actor_critic_adam_eps)
+    optim_world_model = torch.optim.Adam(
+        world_model.parameters(), lr=cfg.world_model_lr, eps=cfg.world_model_adam_eps, fused=True
+    )
+    optim_actor = torch.optim.Adam(
+        actor.parameters(), lr=cfg.actor_critic_lr, eps=cfg.actor_critic_adam_eps, fused=True
+    )
+    optim_critic = torch.optim.Adam(
+        critic.parameters(), lr=cfg.actor_critic_lr, eps=cfg.actor_critic_adam_eps, fused=True
+    )
 
     # --- Training Loop ---
     time_counter = time.time()
     iter_counter = 0
 
-    # how many env steps per training iteration based on batch size/length
-    env_steps_per_iteration = (cfg.batch_size * cfg.batch_length) // cfg.train_ratio
-    print(f"Doing {env_steps_per_iteration} env steps per training iteration.")
+    # Logic for train ratio
+    replay_cost = cfg.batch_size * cfg.batch_length  # steps consumed per update
+    update_credit = 0.0  # accumulated replayed steps
+    updates_done = 0  # total gradient updates run
+    policy_steps = 0  # total env steps (= policy steps)
 
     world_model_loss = None
     actor_loss = None
@@ -101,45 +118,53 @@ def train(cfg: Config, summary_writer=None):
 
     current_obs = None
     for it in range(cfg.num_iterations):
-        for env_step in range(env_steps_per_iteration):
-            # --- Collect a single transition ---
-            if current_obs is None:
-                obs, _ = env.reset()
-                current_obs = obs
-            # Sample action using actor on current world model state
-            with torch.no_grad():
-                # Update model state with latest observation embedding and last action
-                obs_tensor = torch.tensor(current_obs, dtype=torch.float32, device=cfg.device).unsqueeze(0) / 255.0
-                model_state, _ = world_model.step(model_state, last_action_idx, obs_tensor)
-                dist = actor(model_state)
-                action_idx = dist.sample().item()
+        # --- Collect a single transition ---
+        if current_obs is None:
+            obs, _ = env.reset()
+            current_obs = obs
+        # Sample action using actor on current world model state
+        with torch.no_grad():
+            # Update model state with latest observation embedding and last action
+            obs_tensor = torch.tensor(current_obs, dtype=torch.float32, device=cfg.device).unsqueeze(0) / 255.0
+            model_state, _ = world_model.step(model_state, last_action_idx, obs_tensor)
+            dist = actor(model_state)
+            action_idx = dist.sample().item()
 
-                # log real-env policy stats
-                if summary_writer is not None and it % cfg.log_interval == 0 and it > 0 and env_step == 0 and world_model_loss is not None:
-                    ent_env = dist.entropy().mean().item()
-                    summary_writer.add_scalar("policy/env_entropy", ent_env, it)
-                    summary_writer.add_histogram("policy/env_probs", dist.probs, it)
+            # log real-env policy stats
+            if summary_writer is not None and it % cfg.log_interval == 0 and it > 0 and actor_loss is not None:
+                ent_env = dist.entropy().mean().item()
+                summary_writer.add_scalar("policy/env_entropy", ent_env, it)
+                summary_writer.add_histogram("policy/env_probs", dist.probs, it)
 
-            # interact with environment
-            next_obs, reward, terminated, truncated, _ = env.step(action_idx)
-            cont = not (terminated or truncated)
+        # Overwrite action with random action if the actor is not yet trained
+        if actor_loss is None:
+            action_idx = env.action_space.sample()
 
-            buffer.store(current_obs, action_idx, float(reward), cont)
+        # interact with environment
+        next_obs, reward, terminated, truncated, _ = env.step(action_idx)
+        cont = not (terminated or truncated)
 
-            current_obs = next_obs
-            last_action_idx.fill_(action_idx)
+        buffer.store(current_obs, action_idx, float(reward), cont)
 
-            if not cont:
-                current_obs, _ = env.reset()
-                model_state = world_model.init_state(1, cfg.device)
-                last_action_idx.zero_()
+        # for later when doing updates
+        policy_steps += 1
+        update_credit += cfg.train_ratio
+
+        current_obs = next_obs
+        last_action_idx.fill_(action_idx)
+
+        if not cont:
+            current_obs, _ = env.reset()
+            model_state = world_model.init_state(1, cfg.device)
+            last_action_idx.zero_()
 
         # --- When enough data collected, update the models ---
-        if len(buffer) > cfg.batch_size * cfg.batch_length:
+        while len(buffer) >= replay_cost and update_credit >= replay_cost:
+            print(f"Update {updates_done} at iter {it}, total env steps {policy_steps}, "
+                  f"buffer size {len(buffer)}, update credit {update_credit:.1f}")
             # --- train the world model ---
             batch = buffer.sample(cfg.batch_size)
-            obs = batch["observations"]
-            obs = obs.float() / 255.0
+            obs = batch["observations"].float() / 255.0
             actions = batch["actions"]
             rewards = batch["rewards"]
             continues = batch["continues"]
@@ -226,6 +251,10 @@ def train(cfg: Config, summary_writer=None):
             nn.utils.clip_grad_norm_(actor.parameters(), cfg.actor_critic_grad_clip)
             optim_actor.step()
 
+            # consume credit and count this update
+            update_credit -= replay_cost
+            updates_done += 1
+
             # ---- Rich logging ----
             if summary_writer is not None and it % cfg.log_interval == 0 and it > 0:
                 with torch.no_grad():
@@ -277,23 +306,25 @@ def train(cfg: Config, summary_writer=None):
                     summary_writer.add_scalar("reward_pred/std", rew_vec.std(unbiased=False).item(), it)
                     summary_writer.add_scalar("continue_pred/mean", cont_vec.mean().item(), it)
 
-        # ---- Console + scalar logs ----
-        if it % cfg.log_interval == 0 and it > 0 and world_model_loss is not None:
-            elapsed = time.time() - time_counter
-            time_counter = time.time()
-            iters_per_second = iter_counter / elapsed
-            iter_counter = 0
-            print(f"Iters {it}, WM Loss: {world_model_loss.item():.3f}, "
-                  f"Actor Loss: {actor_loss.item():.3f}, "
-                  f"Critic Loss: {critic_loss.item():.3f}, "
-                  f"Iters/sec: {iters_per_second:.3f}")
-            if summary_writer is not None:
-                summary_writer.add_scalar("perf/iters_per_second", iters_per_second, it)
-                summary_writer.add_scalar("train/world_model_loss", world_model_loss.item(), it)
-                if actor_loss is not None:
+                    # ---- Losses ----
+                    summary_writer.add_scalar("train/world_model_loss", world_model_loss.item(), it)
                     summary_writer.add_scalar("train/actor_loss", actor_loss.item(), it)
-                if critic_loss is not None:
                     summary_writer.add_scalar("train/critic_loss", critic_loss.item(), it)
+
+                    # ---- Performance ----
+                    elapsed = time.time() - time_counter
+                    time_counter = time.time()
+                    iters_per_second = iter_counter / elapsed
+                    iter_counter = 0
+                    summary_writer.add_scalar("perf/iters_per_second", iters_per_second, it)
+
+                    # ---- Console log ----
+                    realized_train_ratio = (updates_done * replay_cost) / max(1, policy_steps)
+                    print(f"Iters {it}, WM Loss: {world_model_loss.item():.3f}, "
+                          f"Actor Loss: {actor_loss.item():.3f}, "
+                          f"Critic Loss: {critic_loss.item():.3f}, "
+                          f"Realized Train Ratio: {realized_train_ratio:.3f}, "
+                          f"Iters/sec: {iters_per_second:.1f}")
 
         # Periodic evaluation video
         if it % cfg.video_interval == 0 and it > 0 and summary_writer is not None and world_model_loss is not None:

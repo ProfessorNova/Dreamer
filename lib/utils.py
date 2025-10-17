@@ -2,6 +2,7 @@ import gymnasium as gym
 import numpy as np
 import torch
 from tensorboardX import SummaryWriter
+from PIL import Image
 
 from lib.config import Config
 
@@ -24,7 +25,72 @@ def log_unimix(logits: torch.Tensor, eps: float, dim: int = -1) -> torch.Tensor:
     return probs.clamp_min(1e-8).log()
 
 
+class MaxOverTwoFrames(gym.ObservationWrapper):
+    """Returns max(current, previous) to keep flickering tiny sprites."""
+
+    def __init__(self, env):
+        super().__init__(env)
+        self.prev = None  # HWC uint8
+
+    def reset(self, **kwargs):
+        obs, info = self.env.reset(**kwargs)
+        self.prev = obs
+        return self.observation(obs), info
+
+    def observation(self, obs):
+        if self.prev is None:
+            self.prev = obs
+            return obs
+        out = np.maximum(obs, self.prev)
+        self.prev = obs
+        return out
+
+
+class ResizeObservationPIL(gym.ObservationWrapper):
+    """
+    Resize HWC uint8 using Pillow with selectable interpolation:
+      - 'nearest' -> Resampling.NEAREST  (best to preserve 1px features)
+      - 'area'    -> Resampling.BOX      (good downsampling without blur)
+      - 'bilinear'-> Resampling.BILINEAR (default gym behavior; blurrier)
+    Optionally convert to grayscale first to reduce channels.
+    """
+
+    def __init__(self, env, size=(64, 64), interp="nearest", grayscale=False):
+        super().__init__(env)
+        if isinstance(size, int):
+            size = (size, size)
+        self.size = tuple(size)  # (H, W)
+
+        interp_map = {
+            "nearest": Image.Resampling.NEAREST,
+            "area": Image.Resampling.BOX,
+            "bilinear": Image.Resampling.BILINEAR,
+        }
+        assert interp in interp_map, f"interp must be one of {list(interp_map)}"
+        self.resample = interp_map[interp]
+        self.grayscale = grayscale
+
+        h, w, c = self.observation_space.shape
+        c_out = 1 if grayscale else c
+        self.observation_space = gym.spaces.Box(
+            low=0, high=255, shape=(self.size[0], self.size[1], c_out), dtype=np.uint8
+        )
+
+    def observation(self, obs):
+        # obs: HWC uint8
+        img = Image.fromarray(obs)
+        if self.grayscale:
+            img = img.convert("L")  # (H, W)
+        img = img.resize((self.size[1], self.size[0]), resample=self.resample)  # PIL wants (W,H)
+        arr = np.asarray(img)
+        if self.grayscale:
+            arr = arr[..., None]  # (H, W, 1)
+        return arr.astype(np.uint8)
+
+
 class ImageToPyTorch(gym.ObservationWrapper):
+    """HWC -> CHW for PyTorch, keeps dtype uint8."""
+
     def __init__(self, env):
         super().__init__(env)
         h, w, c = self.observation_space.shape
@@ -36,9 +102,19 @@ class ImageToPyTorch(gym.ObservationWrapper):
         return np.transpose(observation, (2, 0, 1))
 
 
-def make_env(env_id) -> gym.Env:
-    env = gym.make(env_id, render_mode='rgb_array')
-    env = gym.wrappers.ResizeObservation(env, (64, 64))
+# ---------- Factory ----------
+
+def make_env(
+        env_id: str,
+        frame_size: int = 96,
+        resize_interp: str = "nearest",  # "nearest" | "area" | "bilinear"
+        grayscale: bool = False,
+        max_over_two: bool = True,
+) -> gym.Env:
+    env = gym.make(env_id, render_mode="rgb_array")
+    if max_over_two:
+        env = MaxOverTwoFrames(env)
+    env = ResizeObservationPIL(env, size=(frame_size, frame_size), interp=resize_interp, grayscale=grayscale)
     env = ImageToPyTorch(env)
     return env
 
@@ -164,7 +240,7 @@ def log_wm_reconstruction_video(
         x_t = torch.as_tensor(obs_seq[t], dtype=torch.float32, device=cfg.device).unsqueeze(0) / 255.0
 
         model_state, info = world_model.step(model_state, a_prev_idx=last_action_idx, x_cur=x_t)
-        x_recon = symexp(info["x_hat"]).clamp(0.0, 1.0)  # (B,C,H,W)
+        x_recon = info["x_hat"]  # (B,C,H,W)
         recon = (x_recon[0].permute(1, 2, 0).cpu().numpy() * 255.0).astype(np.uint8)
 
         gt = np.transpose(obs_seq[t], (1, 2, 0))  # to HWC
@@ -230,7 +306,7 @@ def log_wm_imagination_video(
     # t = 0: posterior update for alignment (decode too for completeness)
     x0 = torch.as_tensor(obs_seq[0], dtype=torch.float32, device=cfg.device).unsqueeze(0) / 255.0
     model_state, info0 = world_model.step(model_state, a_prev_idx=last_action_idx, x_cur=x0)
-    xhat0 = symexp(info0["x_hat"]).clamp(0.0, 1.0)
+    xhat0 = info0["x_hat"]
     img0 = (xhat0[0].permute(1, 2, 0).cpu().numpy() * 255.0).astype(np.uint8)
     gt = np.transpose(obs_seq[0], (1, 2, 0))  # to HWC
     frames.append(_stack_lr(gt, img0))
@@ -241,7 +317,7 @@ def log_wm_imagination_video(
         # prior step: no x_cur
         model_state, info = world_model.step(model_state, a_prev_idx=torch.tensor([act_seq[t - 1]], device=cfg.device),
                                              x_cur=None)
-        x_im = symexp(info["x_hat"]).clamp(0.0, 1.0)
+        x_im = info["x_hat"]
         im = (x_im[0].permute(1, 2, 0).cpu().numpy() * 255.0).astype(np.uint8)
 
         gt = np.transpose(obs_seq[t], (1, 2, 0))  # to HWC

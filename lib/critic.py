@@ -16,8 +16,8 @@ class Critic(nn.Module):
     def __init__(
             self,
             state_size: int,
-            hidden: int = 512,
-            depth: int = 2,
+            mlp_hidden_units: int = 512,
+            mlp_layers: int = 2,
             num_buckets: int = 255,
             bucket_min: float = -20.0,
             bucket_max: float = 20.0,
@@ -33,13 +33,13 @@ class Critic(nn.Module):
 
         layers = []
         dim = state_size
-        for _ in range(depth):
-            layers.append(nn.LayerNorm(dim))
-            layers.append(nn.Linear(dim, hidden))
+        for _ in range(mlp_layers):
+            layers.append(nn.RMSNorm(dim))
+            layers.append(nn.Linear(dim, mlp_hidden_units))
             layers.append(nn.SiLU())
-            dim = hidden
+            dim = mlp_hidden_units
         self.mlp = nn.Sequential(*layers)
-        self.head = nn.Linear(hidden, num_buckets)
+        self.head = nn.Linear(mlp_hidden_units, num_buckets)
 
         # zero-init output to avoid large early values
         nn.init.zeros_(self.head.weight)
@@ -80,7 +80,7 @@ class Critic(nn.Module):
             x = self.mlp(x.reshape(B * T, D))
             logits = self.head(x).reshape(B, T, self.num_buckets)  # (B,T,num_buckets)
         else:
-            x = self.mlp(x)  # (B,hidden)
+            x = self.mlp(x)  # (B,mlp_hidden_units)
             logits = self.head(x)  # (B,num_buckets)
         return logits
 

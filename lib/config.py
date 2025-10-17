@@ -8,7 +8,7 @@ import torch
 @dataclass
 class Config:
     # --- Environment and device settings ---
-    env_id: str = "ALE/BeamRider-v5"
+    env_id: str = "ALE/Breakout-v5"
     device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # --- Hyperparameters ---
@@ -22,11 +22,11 @@ class Config:
     # World Model
     num_latents = 32
     classes_per_latent = 32
-    free_bits: float = 1.0
     beta_pred: float = 1.0
     beta_dyn: float = 0.5
     beta_rep: float = 0.1
     unimix_eps: float = 0.01
+    free_bits: float = 1.0
     world_model_lr: float = 3e-4
     world_model_adam_eps: float = 1e-8
     world_model_grad_clip: float = 1000.0
@@ -43,15 +43,16 @@ class Config:
     return_normalization_limit: float = 1.0
     return_normalization_decay: float = 0.99
     actor_entropy_scale: float = 3e-4
+    actor_ret_norm_limit: float = 1.0
+    actor_ret_norm_decay: float = 0.99
     actor_critic_lr: float = 3e-5
     actor_critic_adam_eps: float = 1e-5
     actor_critic_grad_clip: float = 100.0
 
     # Network sizes
-    gru_recurrent_units: int = 512
-    cnn_multiplier: int = 32
-    dense_hidden_units: int = 512
-    mlp_layers: int = 2
+    hidden_size: int = 512
+    base_cnn_channels: int = 32
+    mlp_hidden_units: int = 512
 
     # --- Logging and checkpointing ---
     create_artifacts: bool = True
