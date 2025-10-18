@@ -20,7 +20,6 @@ class SequenceModel(nn.Module):
     """
     Sequence model with recurrent state predicts next state h_t
     given current state h_{t-1}, stochastic representation z_{t-1}, and action a_{t-1}.
-    Part of the World Model.
     """
 
     def __init__(
@@ -34,7 +33,17 @@ class SequenceModel(nn.Module):
         self.register_buffer("z_reset", torch.full((num_latents, classes_per_latent), 1.0 / classes_per_latent))
         self.z_proj = nn.Linear(num_latents * classes_per_latent, hidden_size, bias=False)
         self.a_emb = nn.Embedding(action_size, hidden_size)
+        self.norm = nn.LayerNorm(hidden_size)
         self.rnn = nn.GRUCell(hidden_size, hidden_size)
+
+        # stable init
+        for name, p in self.rnn.named_parameters():
+            if 'weight_hh' in name:
+                nn.init.orthogonal_(p)
+            elif 'weight_ih' in name:
+                nn.init.xavier_uniform_(p)
+            elif 'bias' in name:
+                nn.init.zeros_(p)
 
     def forward(
             self,
@@ -65,7 +74,7 @@ class SequenceModel(nn.Module):
             a_vec = a_vec * c_prev
 
         z_flat = z_prev.reshape(z_prev.size(0), -1)
-        x = self.z_proj(z_flat) + a_vec
+        x = self.norm(self.z_proj(z_flat) + a_vec)
         h_t = self.rnn(x, h_prev)
         return h_t
 
@@ -74,7 +83,6 @@ class Encoder(nn.Module):
     """
     Encoder that maps sensory inputs x_t to stochastic representations z_t.
     The posterior predictor that predicts z_t given h_t and x_t -> will act as a teacher for the dynamics predictor.
-    Part of the World Model.
     """
 
     def __init__(
@@ -92,13 +100,13 @@ class Encoder(nn.Module):
         self.num_latents, self.classes_per_latent = num_latents, classes_per_latent
 
         self.conv = nn.Sequential(
-            nn.Conv2d(C, base_cnn_channels, 3, stride=2, padding=1),
+            nn.Conv2d(C, base_cnn_channels, 4, stride=2, padding=1),
             nn.SiLU(),
-            nn.Conv2d(base_cnn_channels, base_cnn_channels * 2, 3, stride=2, padding=1),
+            nn.Conv2d(base_cnn_channels, base_cnn_channels * 2, 4, stride=2, padding=1),
             nn.SiLU(),
-            nn.Conv2d(base_cnn_channels * 2, base_cnn_channels * 4, 3, stride=2, padding=1),
+            nn.Conv2d(base_cnn_channels * 2, base_cnn_channels * 4, 4, stride=2, padding=1),
             nn.SiLU(),
-            nn.Conv2d(base_cnn_channels * 4, base_cnn_channels * 8, 3, stride=2, padding=1),
+            nn.Conv2d(base_cnn_channels * 4, base_cnn_channels * 8, 4, stride=2, padding=1),
             nn.SiLU(),
             nn.Flatten(),
         )
@@ -133,7 +141,6 @@ class DynamicsPredictor(nn.Module):
     """
     Predictor that predicts next stochastic representation z_t.
     The prior predictor that predicts z_t given h_t -> learns to model the dynamics of the environment.
-    Part of the World Model.
     """
 
     def __init__(
@@ -149,7 +156,7 @@ class DynamicsPredictor(nn.Module):
         layers = []
         dim = hidden_size
         for _ in range(mlp_layers):
-            layers.append(nn.RMSNorm(dim))
+            layers.append(nn.LayerNorm(dim))
             layers.append(nn.Linear(dim, mlp_hidden_units))
             layers.append(nn.SiLU())
             dim = mlp_hidden_units
@@ -188,7 +195,7 @@ class RewardPredictor(nn.Module):
         layers = []
         dim = hidden_size + num_latents * classes_per_latent
         for _ in range(mlp_layers):
-            layers.append(nn.RMSNorm(dim))
+            layers.append(nn.LayerNorm(dim))
             layers.append(nn.Linear(dim, mlp_hidden_units))
             layers.append(nn.SiLU())
             dim = mlp_hidden_units
@@ -232,7 +239,7 @@ class ContinuePredictor(nn.Module):
         layers = []
         dim = h_dim + num_latents * classes_per_latent
         for _ in range(mlp_layers):
-            layers.append(nn.RMSNorm(dim))
+            layers.append(nn.LayerNorm(dim))
             layers.append(nn.Linear(dim, mlp_hidden_units))
             layers.append(nn.SiLU())
             dim = mlp_hidden_units
@@ -284,14 +291,13 @@ class Decoder(nn.Module):
         )
 
         self.deconv = nn.Sequential(
-            nn.ConvTranspose2d(base_cnn_channels * 8, base_cnn_channels * 4, 3, stride=2, padding=1, output_padding=1),
+            nn.ConvTranspose2d(base_cnn_channels * 8, base_cnn_channels * 4, 4, stride=2, padding=1),
             nn.SiLU(),
-            nn.ConvTranspose2d(base_cnn_channels * 4, base_cnn_channels * 2, 3, stride=2, padding=1, output_padding=1),
+            nn.ConvTranspose2d(base_cnn_channels * 4, base_cnn_channels * 2, 4, stride=2, padding=1),
             nn.SiLU(),
-            nn.ConvTranspose2d(base_cnn_channels * 2, base_cnn_channels, 3, stride=2, padding=1, output_padding=1),
+            nn.ConvTranspose2d(base_cnn_channels * 2, base_cnn_channels, 4, stride=2, padding=1),
             nn.SiLU(),
-            nn.ConvTranspose2d(base_cnn_channels, C, 3, stride=2, padding=1, output_padding=1),
-            nn.Sigmoid()
+            nn.ConvTranspose2d(base_cnn_channels, C, 4, stride=2, padding=1),
         )
 
     def forward(self, h_t: torch.Tensor, z_t: torch.Tensor) -> torch.Tensor:
@@ -436,7 +442,7 @@ class WorldModel(nn.Module):
         # Heads (reconstruction, reward, continue)
         r_hat = self.rew(h_cur, z)  # (B,1)
         c_hat = self.cont(h_cur, z)  # (B,1)
-        x_hat = self.dec(h_cur, z)  # (B,C,H,W)
+        x_logits = self.dec(h_cur, z)  # (B,C,H,W)
 
         new_state = WorldModelState(h=h_cur, z=z)
         info: Dict[str, Any] = {
@@ -444,7 +450,8 @@ class WorldModel(nn.Module):
             "post_logits": z_logits_post,  # None in imagination
             "r_hat": r_hat,  # (B,1)
             "c_hat": c_hat,  # (B,1)
-            "x_hat": x_hat,  # (B,C,H,W)
+            "x_hat": torch.sigmoid(x_logits),  # (B,C,H,W)
+            "x_logits": x_logits,  # (B,C,H,W)
         }
         return new_state, info
 
@@ -469,7 +476,7 @@ class WorldModel(nn.Module):
     @staticmethod
     def _prediction_loss(
             x_true: torch.Tensor,  # (B,C,H,W)
-            x_hat: torch.Tensor,  # (B,C,H,W)
+            x_logits: torch.Tensor,  # (B,C,H,W)
             r_true: torch.Tensor,  # (B,1)
             r_hat: torch.Tensor,  # (B,1)
             c_true: torch.Tensor,  # (B,1) {0, 1}
@@ -480,7 +487,7 @@ class WorldModel(nn.Module):
         and the continue predictor via binary classification loss.
         """
         # Image reconstruction
-        img_loss = F.binary_cross_entropy(x_hat, x_true, reduction="none").mean(dim=(-3, -2, -1))  # (B,)
+        img_loss = F.binary_cross_entropy_with_logits(x_logits, x_true, reduction="none").mean(dim=(-3, -2, -1))  # (B,)
 
         # Reward in symlog space
         rew_loss = 0.5 * (r_hat - symlog(r_true)).pow(2).mean(dim=-1)  # (B,)
@@ -564,7 +571,7 @@ class WorldModel(nn.Module):
             # prediction loss
             pred_loss = self._prediction_loss(
                 x_true=obs[:, t],  # (B,C,H,W)
-                x_hat=info["x_hat"],  # (B,C,H,W)
+                x_logits=info["x_logits"],  # (B,C,H,W)
                 r_true=rewards[:, t],  # (B,1)
                 r_hat=info["r_hat"],  # (B,1)
                 c_true=continues[:, t],  # (B,1)

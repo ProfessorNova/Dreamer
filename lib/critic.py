@@ -34,7 +34,7 @@ class Critic(nn.Module):
         layers = []
         dim = state_size
         for _ in range(mlp_layers):
-            layers.append(nn.RMSNorm(dim))
+            layers.append(nn.LayerNorm(dim))
             layers.append(nn.Linear(dim, mlp_hidden_units))
             layers.append(nn.SiLU())
             dim = mlp_hidden_units

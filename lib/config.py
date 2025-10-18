@@ -20,8 +20,8 @@ class Config:
     train_ratio: int = 1024
 
     # World Model
-    num_latents = 64
-    classes_per_latent = 64
+    num_latents = 32
+    classes_per_latent = 32
     beta_pred: float = 1.0
     beta_dyn: float = 0.5
     beta_rep: float = 0.1
@@ -50,9 +50,9 @@ class Config:
     actor_critic_grad_clip: float = 100.0
 
     # Network sizes
-    hidden_size: int = 1024
-    base_cnn_channels: int = 64
-    mlp_hidden_units: int = 1024
+    hidden_size: int = 512
+    base_cnn_channels: int = 32
+    mlp_hidden_units: int = 512
 
     # --- Logging and checkpointing ---
     create_artifacts: bool = True

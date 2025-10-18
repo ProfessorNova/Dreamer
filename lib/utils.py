@@ -25,69 +25,6 @@ def log_unimix(logits: torch.Tensor, eps: float, dim: int = -1) -> torch.Tensor:
     return probs.clamp_min(1e-8).log()
 
 
-class MaxOverTwoFrames(gym.ObservationWrapper):
-    """Returns max(current, previous) to keep flickering tiny sprites."""
-
-    def __init__(self, env):
-        super().__init__(env)
-        self.prev = None  # HWC uint8
-
-    def reset(self, **kwargs):
-        obs, info = self.env.reset(**kwargs)
-        self.prev = obs
-        return self.observation(obs), info
-
-    def observation(self, obs):
-        if self.prev is None:
-            self.prev = obs
-            return obs
-        out = np.maximum(obs, self.prev)
-        self.prev = obs
-        return out
-
-
-class ResizeObservationPIL(gym.ObservationWrapper):
-    """
-    Resize HWC uint8 using Pillow with selectable interpolation:
-      - 'nearest' -> Resampling.NEAREST  (best to preserve 1px features)
-      - 'area'    -> Resampling.BOX      (good downsampling without blur)
-      - 'bilinear'-> Resampling.BILINEAR (default gym behavior; blurrier)
-    Optionally convert to grayscale first to reduce channels.
-    """
-
-    def __init__(self, env, size=(64, 64), interp="nearest", grayscale=False):
-        super().__init__(env)
-        if isinstance(size, int):
-            size = (size, size)
-        self.size = tuple(size)  # (H, W)
-
-        interp_map = {
-            "nearest": Image.Resampling.NEAREST,
-            "area": Image.Resampling.BOX,
-            "bilinear": Image.Resampling.BILINEAR,
-        }
-        assert interp in interp_map, f"interp must be one of {list(interp_map)}"
-        self.resample = interp_map[interp]
-        self.grayscale = grayscale
-
-        h, w, c = self.observation_space.shape
-        c_out = 1 if grayscale else c
-        self.observation_space = gym.spaces.Box(
-            low=0, high=255, shape=(self.size[0], self.size[1], c_out), dtype=np.uint8
-        )
-
-    def observation(self, obs):
-        # obs: HWC uint8
-        img = Image.fromarray(obs)
-        if self.grayscale:
-            img = img.convert("L")  # (H, W)
-        img = img.resize((self.size[1], self.size[0]), resample=self.resample)  # PIL wants (W,H)
-        arr = np.asarray(img)
-        if self.grayscale:
-            arr = arr[..., None]  # (H, W, 1)
-        return arr.astype(np.uint8)
-
-
 class ImageToPyTorch(gym.ObservationWrapper):
     """HWC -> CHW for PyTorch, keeps dtype uint8."""
 
@@ -106,17 +43,10 @@ class ImageToPyTorch(gym.ObservationWrapper):
 
 def make_env(
         env_id: str,
-        frame_size: int = 96,
-        resize_interp: str = "nearest",  # "nearest" | "area" | "bilinear"
-        grayscale: bool = False,
-        max_over_two: bool = False,
+        frame_size: int = 64,
 ) -> gym.Env:
     env = gym.make(env_id, render_mode="rgb_array")
-    # if max_over_two:
-    #     env = MaxOverTwoFrames(env)
-    # env = ResizeObservationPIL(env, size=(frame_size, frame_size), interp=resize_interp, grayscale=grayscale)
     env = gym.wrappers.ResizeObservation(env, (frame_size, frame_size))
-    env = gym.wrappers.ClipReward(env, min_reward=-1.0, max_reward=1.0)
     env = ImageToPyTorch(env)
     return env
 
@@ -202,7 +132,7 @@ def log_wm_reconstruction_video(
     """
     Posterior reconstructions vs ground truth:
       - collect a short episode with actor
-      - at each step, feed x_t to encoder (posterior) and decode x_hat
+      - at each step, feed x_t to encoder (posterior) and decode x_logits
       - log side-by-side (GT | Recon)
     """
     # Collect short rollout with actions & ground-truth frames
