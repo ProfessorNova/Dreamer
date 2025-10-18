@@ -109,12 +109,14 @@ def make_env(
         frame_size: int = 96,
         resize_interp: str = "nearest",  # "nearest" | "area" | "bilinear"
         grayscale: bool = False,
-        max_over_two: bool = True,
+        max_over_two: bool = False,
 ) -> gym.Env:
     env = gym.make(env_id, render_mode="rgb_array")
-    if max_over_two:
-        env = MaxOverTwoFrames(env)
-    env = ResizeObservationPIL(env, size=(frame_size, frame_size), interp=resize_interp, grayscale=grayscale)
+    # if max_over_two:
+    #     env = MaxOverTwoFrames(env)
+    # env = ResizeObservationPIL(env, size=(frame_size, frame_size), interp=resize_interp, grayscale=grayscale)
+    env = gym.wrappers.ResizeObservation(env, (frame_size, frame_size))
+    env = gym.wrappers.ClipReward(env, min_reward=-1.0, max_reward=1.0)
     env = ImageToPyTorch(env)
     return env
 

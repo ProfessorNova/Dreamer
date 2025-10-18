@@ -142,10 +142,12 @@ class Critic(nn.Module):
             model_states: WorldModelState,
             returns: torch.Tensor,  # (B,) or (B,T) lambda-returns
     ) -> torch.Tensor:
-        y = self._twohot(symlog(returns))
+        y = self._twohot(symlog(returns.detach()))
         logits = self(model_states)
-        logp = F.log_softmax(logits, dim=-1)
-        cross_entropy = -(y * logp).sum(dim=-1)  # (B,) or (B,T)
+        log_probs = F.log_softmax(logits, dim=-1)
+
+        # Cross-entropy loss with soft targets
+        cross_entropy = -(y * log_probs).sum(dim=-1)
         loss = cross_entropy.mean()
 
         # EMA regularization towards slow network
@@ -153,7 +155,7 @@ class Critic(nn.Module):
             with torch.no_grad():
                 slow_logits = self.slow(model_states)
                 slow_probs = F.softmax(slow_logits, dim=-1)
-            cross_entropy_slow = -(slow_probs * logp).sum(dim=-1)
-            loss += self.ema_regularizer * cross_entropy_slow.mean()
+            reg = F.kl_div(log_probs, slow_probs, log_target=False, reduction="none").sum(dim=-1).mean()
+            loss += self.ema_regularizer * reg
 
         return loss

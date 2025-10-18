@@ -10,29 +10,27 @@ class EMAPercentileScale(nn.Module):
         super().__init__()
         self.decay = decay
         self.min_scale = min_scale
-        self.register_buffer("p5", torch.tensor(0.0))
-        self.register_buffer("p95", torch.tensor(1.0))
-        self._init = False
+        self.register_buffer("p05", torch.tensor(0.0))
+        self.register_buffer("p95", torch.tensor(0.0))
 
     def update_get_S(self, x: torch.Tensor) -> torch.Tensor:
         x = x.detach().reshape(-1).float()
+        cur_S = (self.p95 - self.p05).clamp_min(self.min_scale)
+
         if x.numel() == 0:
-            return x.new_tensor(1.0)
+            return cur_S
+
         q05 = torch.quantile(x, 0.05)
         q95 = torch.quantile(x, 0.95)
-        # ensure non-degenerate span
         q95 = torch.maximum(q95, q05 + x.new_tensor(1e-8))
+
         if self.training:
-            if not self._init:
-                self.p5.copy_(q05)
-                self.p95.copy_(q95)
-                self._init = True
-            else:
-                d = 1.0 - self.decay
-                self.p5.mul_(self.decay).add_(d * q05)
-                self.p95.mul_(self.decay).add_(d * q95)
-        S = (self.p95 - self.p5)
-        return torch.maximum(S, x.new_tensor(self.min_scale))  # max(1, S)
+            d = 1.0 - self.decay
+            self.p05.mul_(self.decay).add_(d * q05)
+            self.p95.mul_(self.decay).add_(d * q95)
+
+        S = (self.p95 - self.p05)
+        return torch.maximum(S, x.new_tensor(self.min_scale))
 
 
 class Actor(nn.Module):
@@ -68,6 +66,10 @@ class Actor(nn.Module):
             dim = mlp_hidden_units
         self.mlp = nn.Sequential(*layers)
         self.head = nn.Linear(mlp_hidden_units, action_size)
+
+        # zero-init output to have initially uniform policy
+        nn.init.zeros_(self.head.weight)
+        nn.init.zeros_(self.head.bias)
 
         self.ret_scale = EMAPercentileScale(decay=ret_norm_decay, min_scale=ret_norm_limit)
 
@@ -108,13 +110,15 @@ class Actor(nn.Module):
             model_states: WorldModelState,
             actions: torch.Tensor,  # (B,) or (B,T) long indices
             returns: torch.Tensor,  # (B,) or (B,T) lambda-returns
+            values: torch.Tensor,  # (B,) or (B,T) predicted values
     ) -> torch.Tensor:
         dist = self(model_states)
         log_probs = dist.log_prob(actions)
 
-        S = self.ret_scale.update_get_S(returns)
-        target = returns / S
-        policy_loss = -(log_probs * target).mean()
+        scale = self.ret_scale.update_get_S(returns.detach())
+        adv = (returns - values).detach()
+        adv_scaled = adv / scale
+        policy_loss = -(adv_scaled * log_probs).mean()
 
         entropy = dist.entropy().mean()
         loss = policy_loss - self.entropy_scale * entropy

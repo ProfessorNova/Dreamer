@@ -479,10 +479,13 @@ class WorldModel(nn.Module):
         The prediction loss trains the decoder and reward predictor via the symlog loss
         and the continue predictor via binary classification loss.
         """
-        img_loss = 0.5 * ((x_hat - x_true) ** 2).sum(dim=(-3, -2, -1))  # (B,)
-        rew_loss = 0.5 * ((r_hat - symlog(r_true)) ** 2).sum(dim=(-1,))  # (B,)
+        # Image reconstruction
+        img_loss = F.binary_cross_entropy(x_hat, x_true, reduction="none").mean(dim=(-3, -2, -1))  # (B,)
 
-        # Binary cross-entropy loss for continue flag
+        # Reward in symlog space
+        rew_loss = 0.5 * (r_hat - symlog(r_true)).pow(2).mean(dim=-1)  # (B,)
+
+        # Continue (Bernoulli)
         cont_loss = F.binary_cross_entropy_with_logits(c_hat, c_true, reduction="none").squeeze(-1)  # (B,)
 
         return img_loss + rew_loss + cont_loss

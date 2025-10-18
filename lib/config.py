@@ -8,20 +8,20 @@ import torch
 @dataclass
 class Config:
     # --- Environment and device settings ---
-    env_id: str = "ALE/Breakout-v5"
+    env_id: str = "ALE/BeamRider-v5"
     device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # --- Hyperparameters ---
     # General
-    num_iterations: int = 10_000_000
-    replay_capacity: int = 1_000_000
+    num_iterations: int = 100_000
+    replay_capacity: int = 100_000
     batch_size: int = 16
     batch_length: int = 64
     train_ratio: int = 1024
 
     # World Model
-    num_latents = 32
-    classes_per_latent = 32
+    num_latents = 64
+    classes_per_latent = 64
     beta_pred: float = 1.0
     beta_dyn: float = 0.5
     beta_rep: float = 0.1
@@ -50,9 +50,9 @@ class Config:
     actor_critic_grad_clip: float = 100.0
 
     # Network sizes
-    hidden_size: int = 512
-    base_cnn_channels: int = 32
-    mlp_hidden_units: int = 512
+    hidden_size: int = 1024
+    base_cnn_channels: int = 64
+    mlp_hidden_units: int = 1024
 
     # --- Logging and checkpointing ---
     create_artifacts: bool = True
@@ -62,7 +62,7 @@ class Config:
     save_interval: int = 1000
     video_interval: int = 500
     video_fps: int = 20
-    video_max_frames: int = 200
+    video_max_frames: int = 500
 
     # --- Random seed for reproducibility ---
     seed: int = 42
