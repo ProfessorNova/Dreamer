@@ -8,7 +8,7 @@ import torch
 @dataclass
 class Config:
     # --- Environment and device settings ---
-    env_id: str = "ALE/BeamRider-v5"
+    env_id: str = "ALE/Pong-v5"
     device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # --- Hyperparameters ---
@@ -17,13 +17,13 @@ class Config:
     replay_capacity: int = 100_000
     batch_size: int = 16
     batch_length: int = 64
-    train_ratio: int = 1024
+    train_ratio: int = 8.0
 
     # World Model
     num_latents = 32
     classes_per_latent = 32
     beta_pred: float = 1.0
-    beta_dyn: float = 0.5
+    beta_dyn: float = 1.0
     beta_rep: float = 0.1
     unimix_eps: float = 0.01
     free_bits: float = 1.0

@@ -47,7 +47,7 @@ class Actor(nn.Module):
             state_size: int,
             action_size: int,
             mlp_hidden_units: int = 512,
-            mlp_layers: int = 2,
+            mlp_layers: int = 3,
             entropy_scale: float = 1e-3,
             ret_norm_limit: float = 1.0,
             ret_norm_decay: float = 0.99,
@@ -60,9 +60,9 @@ class Actor(nn.Module):
         layers = []
         dim = state_size
         for _ in range(mlp_layers):
-            layers.append(nn.LayerNorm(dim))
             layers.append(nn.Linear(dim, mlp_hidden_units))
             layers.append(nn.SiLU())
+            layers.append(nn.RMSNorm(mlp_hidden_units))
             dim = mlp_hidden_units
         self.mlp = nn.Sequential(*layers)
         self.head = nn.Linear(mlp_hidden_units, action_size)

@@ -1,3 +1,4 @@
+import math
 from dataclasses import dataclass
 from typing import Tuple, Optional, Dict, Any
 
@@ -5,7 +6,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
-from torch.distributions import Categorical, kl_divergence
 
 from lib.utils import symlog, log_unimix
 
@@ -31,19 +31,13 @@ class SequenceModel(nn.Module):
     ):
         super().__init__()
         self.register_buffer("z_reset", torch.full((num_latents, classes_per_latent), 1.0 / classes_per_latent))
-        self.z_proj = nn.Linear(num_latents * classes_per_latent, hidden_size, bias=False)
-        self.a_emb = nn.Embedding(action_size, hidden_size)
-        self.norm = nn.LayerNorm(hidden_size)
-        self.rnn = nn.GRUCell(hidden_size, hidden_size)
+        self.a_emb = nn.Embedding(action_size, 64)
 
-        # stable init
-        for name, p in self.rnn.named_parameters():
-            if 'weight_hh' in name:
-                nn.init.orthogonal_(p)
-            elif 'weight_ih' in name:
-                nn.init.xavier_uniform_(p)
-            elif 'bias' in name:
-                nn.init.zeros_(p)
+        self.z_proj = nn.Linear(num_latents * classes_per_latent, hidden_size)
+        self.a_proj = nn.Linear(64, hidden_size)
+
+        self.norm = nn.RMSNorm(hidden_size)
+        self.rnn = nn.GRUCell(hidden_size, hidden_size)
 
     def forward(
             self,
@@ -73,10 +67,11 @@ class SequenceModel(nn.Module):
         if c_prev is not None:
             a_vec = a_vec * c_prev
 
-        z_flat = z_prev.reshape(z_prev.size(0), -1)
-        x = self.norm(self.z_proj(z_flat) + a_vec)
-        h_t = self.rnn(x, h_prev)
-        return h_t
+        z_flat = z_prev.view(z_prev.size(0), -1)
+        x = self.z_proj(z_flat)
+        x = x.add_(self.a_proj(a_vec))
+        x = self.norm(x)
+        return self.rnn(x, h_prev)
 
 
 class Encoder(nn.Module):
@@ -100,16 +95,13 @@ class Encoder(nn.Module):
         self.num_latents, self.classes_per_latent = num_latents, classes_per_latent
 
         self.conv = nn.Sequential(
-            nn.Conv2d(C, base_cnn_channels, 4, stride=2, padding=1),
-            nn.SiLU(),
-            nn.Conv2d(base_cnn_channels, base_cnn_channels * 2, 4, stride=2, padding=1),
-            nn.SiLU(),
-            nn.Conv2d(base_cnn_channels * 2, base_cnn_channels * 4, 4, stride=2, padding=1),
-            nn.SiLU(),
-            nn.Conv2d(base_cnn_channels * 4, base_cnn_channels * 8, 4, stride=2, padding=1),
-            nn.SiLU(),
+            nn.Conv2d(C, base_cnn_channels, 4, stride=2, padding=1), nn.SiLU(),
+            nn.Conv2d(base_cnn_channels, 2 * base_cnn_channels, 4, stride=2, padding=1), nn.SiLU(),
+            nn.Conv2d(2 * base_cnn_channels, 4 * base_cnn_channels, 4, stride=2, padding=1), nn.SiLU(),
+            nn.Conv2d(4 * base_cnn_channels, 8 * base_cnn_channels, 4, stride=2, padding=1), nn.SiLU(),
             nn.Flatten(),
         )
+
         conv_out_size = self._get_conv_out(obs_shape)
         self.fc = nn.Sequential(
             nn.Linear(conv_out_size + hidden_size, num_latents * classes_per_latent),
@@ -132,7 +124,7 @@ class Encoder(nn.Module):
         B, C, H, W = x_t.shape
         assert (C, H, W) == (self.C, self.H, self.W), f"Got {(C, H, W)}, expected {(self.C, self.H, self.W)}"
         conv_out = self.conv(x_t)
-        combined = torch.cat([conv_out, h_t], dim=-1)
+        combined = torch.cat([conv_out, h_t.detach()], dim=-1)
         logits = self.fc(combined).view(-1, self.num_latents, self.classes_per_latent)
         return logits
 
@@ -149,16 +141,16 @@ class DynamicsPredictor(nn.Module):
             num_latents: int = 32,
             classes_per_latent: int = 32,
             mlp_hidden_units: int = 512,
-            mlp_layers: int = 2,
+            mlp_layers: int = 3,
     ):
         super().__init__()
 
         layers = []
         dim = hidden_size
         for _ in range(mlp_layers):
-            layers.append(nn.LayerNorm(dim))
             layers.append(nn.Linear(dim, mlp_hidden_units))
             layers.append(nn.SiLU())
+            layers.append(nn.RMSNorm(mlp_hidden_units))
             dim = mlp_hidden_units
         self.mlp = nn.Sequential(*layers)
         self.head = nn.Linear(mlp_hidden_units, num_latents * classes_per_latent)
@@ -188,16 +180,16 @@ class RewardPredictor(nn.Module):
             num_latents: int = 32,
             classes_per_latent: int = 32,
             mlp_hidden_units: int = 512,
-            mlp_layers: int = 2,
+            mlp_layers: int = 1,
     ):
         super().__init__()
 
         layers = []
         dim = hidden_size + num_latents * classes_per_latent
         for _ in range(mlp_layers):
-            layers.append(nn.LayerNorm(dim))
             layers.append(nn.Linear(dim, mlp_hidden_units))
             layers.append(nn.SiLU())
+            layers.append(nn.RMSNorm(mlp_hidden_units))
             dim = mlp_hidden_units
         self.mlp = nn.Sequential(*layers)
         self.head = nn.Linear(mlp_hidden_units, 1)
@@ -232,16 +224,16 @@ class ContinuePredictor(nn.Module):
             num_latents: int = 32,
             classes_per_latent: int = 32,
             mlp_hidden_units: int = 512,
-            mlp_layers: int = 2,
+            mlp_layers: int = 1,
     ):
         super().__init__()
 
         layers = []
         dim = h_dim + num_latents * classes_per_latent
         for _ in range(mlp_layers):
-            layers.append(nn.LayerNorm(dim))
             layers.append(nn.Linear(dim, mlp_hidden_units))
             layers.append(nn.SiLU())
+            layers.append(nn.RMSNorm(mlp_hidden_units))
             dim = mlp_hidden_units
         self.mlp = nn.Sequential(*layers)
         self.head = nn.Linear(mlp_hidden_units, 1)
@@ -284,6 +276,8 @@ class Decoder(nn.Module):
         self.base_h, self.base_w = H // 16, W // 16
         self.cnn_multiplier = base_cnn_channels
 
+        B = base_cnn_channels
+
         self.fc = nn.Sequential(
             nn.Linear(hidden_size + num_latents * classes_per_latent,
                       base_cnn_channels * 8 * self.base_h * self.base_w),
@@ -291,13 +285,11 @@ class Decoder(nn.Module):
         )
 
         self.deconv = nn.Sequential(
-            nn.ConvTranspose2d(base_cnn_channels * 8, base_cnn_channels * 4, 4, stride=2, padding=1),
-            nn.SiLU(),
-            nn.ConvTranspose2d(base_cnn_channels * 4, base_cnn_channels * 2, 4, stride=2, padding=1),
-            nn.SiLU(),
-            nn.ConvTranspose2d(base_cnn_channels * 2, base_cnn_channels, 4, stride=2, padding=1),
-            nn.SiLU(),
+            nn.ConvTranspose2d(8 * base_cnn_channels, 4 * base_cnn_channels, 4, stride=2, padding=1), nn.SiLU(),
+            nn.ConvTranspose2d(4 * base_cnn_channels, 2 * base_cnn_channels, 4, stride=2, padding=1), nn.SiLU(),
+            nn.ConvTranspose2d(2 * base_cnn_channels, base_cnn_channels, 4, stride=2, padding=1), nn.SiLU(),
             nn.ConvTranspose2d(base_cnn_channels, C, 4, stride=2, padding=1),
+            nn.Sigmoid(),
         )
 
     def forward(self, h_t: torch.Tensor, z_t: torch.Tensor) -> torch.Tensor:
@@ -442,7 +434,7 @@ class WorldModel(nn.Module):
         # Heads (reconstruction, reward, continue)
         r_hat = self.rew(h_cur, z)  # (B,1)
         c_hat = self.cont(h_cur, z)  # (B,1)
-        x_logits = self.dec(h_cur, z)  # (B,C,H,W)
+        x_hat = self.dec(h_cur, z)  # (B,C,H,W)
 
         new_state = WorldModelState(h=h_cur, z=z)
         info: Dict[str, Any] = {
@@ -450,33 +442,32 @@ class WorldModel(nn.Module):
             "post_logits": z_logits_post,  # None in imagination
             "r_hat": r_hat,  # (B,1)
             "c_hat": c_hat,  # (B,1)
-            "x_hat": torch.sigmoid(x_logits),  # (B,C,H,W)
-            "x_logits": x_logits,  # (B,C,H,W)
+            "x_hat": x_hat,  # (B,C,H,W)
         }
         return new_state, info
 
     def _sample_z(self, logits: torch.Tensor) -> torch.Tensor:
         log_prob = log_unimix(logits, self.unimix_eps, dim=-1)
-        return F.gumbel_softmax(log_prob, tau=1.0, hard=True, dim=-1)
+        return F.gumbel_softmax(log_prob, tau=1, hard=True, dim=-1)
 
     def _kl_loss(self, q_logits: torch.Tensor, p_logits: torch.Tensor) -> torch.Tensor:
-        K = q_logits.size(-1)
+        # log-unimix returns log((1-eps)*softmax + eps/K)
+        log_q = log_unimix(q_logits, self.unimix_eps, dim=-1)  # (B, L, K)
+        log_p = log_unimix(p_logits, self.unimix_eps, dim=-1)  # (B, L, K)
 
-        # Unimix both sides: (1 - eps)*softmax + eps/K
-        q_probs = (1.0 - self.unimix_eps) * F.softmax(q_logits, dim=-1) + self.unimix_eps / float(K)
-        p_probs = (1.0 - self.unimix_eps) * F.softmax(p_logits, dim=-1) + self.unimix_eps / float(K)
+        q = log_q.exp()  # (B, L, K)
+        kl_latents = (q * (log_q - log_p)).sum(dim=-1)  # (B, L)
 
-        # KL divergence per latent: (B, L)
-        kl_latent = kl_divergence(Categorical(probs=q_probs), Categorical(probs=p_probs))
-        kl_latent = torch.clamp(kl_latent, min=self.free_bits / float(self.num_latents))
-        kl = kl_latent.sum(dim=-1)  # sum over latents -> (B,)
+        # per-latent free bits, split across L when summing
+        fb_per_latent = self.free_bits / float(self.num_latents)
+        kl_latents = kl_latents.clamp_min(fb_per_latent)  # (B, L)
 
-        return kl
+        return kl_latents.sum(dim=-1)  # (B,)
 
     @staticmethod
     def _prediction_loss(
             x_true: torch.Tensor,  # (B,C,H,W)
-            x_logits: torch.Tensor,  # (B,C,H,W)
+            x_hat: torch.Tensor,  # (B,C,H,W)
             r_true: torch.Tensor,  # (B,1)
             r_hat: torch.Tensor,  # (B,1)
             c_true: torch.Tensor,  # (B,1) {0, 1}
@@ -487,12 +478,12 @@ class WorldModel(nn.Module):
         and the continue predictor via binary classification loss.
         """
         # Image reconstruction
-        img_loss = F.binary_cross_entropy_with_logits(x_logits, x_true, reduction="none").mean(dim=(-3, -2, -1))  # (B,)
+        img_loss = 0.5 * (x_hat - x_true).pow(2).mean(dim=(-3, -2, -1))  # (B,)
 
         # Reward in symlog space
         rew_loss = 0.5 * (r_hat - symlog(r_true)).pow(2).mean(dim=-1)  # (B,)
 
-        # Continue (Bernoulli)
+        # Continue flag
         cont_loss = F.binary_cross_entropy_with_logits(c_hat, c_true, reduction="none").squeeze(-1)  # (B,)
 
         return img_loss + rew_loss + cont_loss
@@ -541,23 +532,23 @@ class WorldModel(nn.Module):
         B, T = obs.size(0), obs.size(1)
 
         # prev actions a_{t-1}: left-shift, inject 0 for t=0
-        a_prev = torch.zeros(B, T, dtype=torch.long, device=obs.device)
-        a_prev[:, 1:] = actions[:, :-1]
+        a_prev = torch.roll(actions, 1, dims=1)
+        a_prev[:, 0] = 0
 
         # Add dim for rewards to be (B,T,1)
-        rewards = rewards.unsqueeze(-1)
+        rewards = rewards.unsqueeze(-1).contiguous()
 
         # Add dim for continues to be (B,T,1)
-        continues = continues.float().unsqueeze(-1)
+        continues = continues.float().unsqueeze(-1).contiguous()
 
         # At t=0 there is no boundary
         c_prev = torch.ones(B, 1, device=obs.device)
 
         state = init_state if init_state is not None else self.init_state(B, device=obs.device, dtype=obs.dtype)
 
-        pred_losses = []
-        dyn_losses = []
-        rep_losses = []
+        pred_sum = torch.zeros((), device=obs.device, dtype=obs.dtype)
+        dyn_sum = torch.zeros((), device=obs.device, dtype=obs.dtype)
+        rep_sum = torch.zeros((), device=obs.device, dtype=obs.dtype)
 
         for t in range(T):
             # one RSSM step
@@ -569,44 +560,34 @@ class WorldModel(nn.Module):
             )
 
             # prediction loss
-            pred_loss = self._prediction_loss(
-                x_true=obs[:, t],  # (B,C,H,W)
-                x_logits=info["x_logits"],  # (B,C,H,W)
-                r_true=rewards[:, t],  # (B,1)
-                r_hat=info["r_hat"],  # (B,1)
-                c_true=continues[:, t],  # (B,1)
-                c_hat=info["c_hat"],  # (B,1)
-            )
-            pred_losses.append(pred_loss)
+            pred_sum = pred_sum + self._prediction_loss(
+                x_true=obs[:, t],
+                x_hat=info["x_hat"],
+                r_true=rewards[:, t],
+                r_hat=info["r_hat"],
+                c_true=continues[:, t],
+                c_hat=info["c_hat"],
+            ).mean()
 
             # dynamics loss
-            dyn_loss = self._dynamics_loss(
-                post_logits=info["post_logits"],
-                prior_logits=info["prior_logits"],
-            )
-            dyn_losses.append(dyn_loss)
+            dyn_sum = dyn_sum + self._dynamics_loss(info["post_logits"], info["prior_logits"]).mean()
 
             # representation loss
-            rep_loss = self._representation_loss(
-                post_logits=info["post_logits"],
-                prior_logits=info["prior_logits"],
-            )
-            rep_losses.append(rep_loss)
+            rep_sum = rep_sum + self._representation_loss(info["post_logits"], info["prior_logits"]).mean()
 
-            # continue flag for next step
+            # continue flag and x_prev for next step
             c_prev = continues[:, t]
 
-        # Stack losses over time -> (T,B), then mean over time and batch -> (1,)
-        pred = torch.stack(pred_losses, dim=0).mean()
-        dyn = torch.stack(dyn_losses, dim=0).mean()
-        rep = torch.stack(rep_losses, dim=0).mean()
+        # average over time
+        pred = pred_sum / T
+        dyn = dyn_sum / T
+        rep = rep_sum / T
 
         total_loss = self.beta_pred * pred + self.beta_dyn * dyn + self.beta_rep * rep
-        tensor_dict: Dict[str, Any] = {
+        return total_loss, {
             "total_loss": total_loss,
             "pred_loss": pred,
             "dyn_loss": dyn,
             "rep_loss": rep,
             "state": state,
         }
-        return total_loss, tensor_dict

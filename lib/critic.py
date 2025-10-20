@@ -17,7 +17,7 @@ class Critic(nn.Module):
             self,
             state_size: int,
             mlp_hidden_units: int = 512,
-            mlp_layers: int = 2,
+            mlp_layers: int = 3,
             num_buckets: int = 255,
             bucket_min: float = -20.0,
             bucket_max: float = 20.0,
@@ -34,9 +34,9 @@ class Critic(nn.Module):
         layers = []
         dim = state_size
         for _ in range(mlp_layers):
-            layers.append(nn.LayerNorm(dim))
             layers.append(nn.Linear(dim, mlp_hidden_units))
             layers.append(nn.SiLU())
+            layers.append(nn.RMSNorm(mlp_hidden_units))
             dim = mlp_hidden_units
         self.mlp = nn.Sequential(*layers)
         self.head = nn.Linear(mlp_hidden_units, num_buckets)

@@ -104,23 +104,20 @@ def train(cfg: Config, summary_writer=None):
 
     # --- Training Loop ---
     time_counter = time.time()
-    iter_counter = 0
 
     # Logic for train ratio
-    replay_cost = cfg.batch_size * cfg.batch_length  # steps consumed per update
     update_credit = 0.0  # accumulated replayed steps
     updates_done = 0  # total gradient updates run
+    update_counter = 0  # counts updates for perf logging
     policy_steps = 0  # total env steps (= policy steps)
-
-    world_model_loss = None
-    actor_loss = None
-    critic_loss = None
+    warmup_steps = (cfg.batch_size * cfg.train_ratio) * 3 + cfg.batch_length
 
     model_state = world_model.init_state(1, cfg.device)
     last_action_idx = torch.zeros(1, dtype=torch.long, device=cfg.device)
+    last_cont = torch.ones(1, dtype=torch.float32, device=cfg.device)
 
     current_obs = None
-    for it in range(cfg.num_iterations):
+    for _ in range(cfg.num_iterations):
         # --- Collect a single transition ---
         if current_obs is None:
             obs, _ = env.reset()
@@ -129,18 +126,12 @@ def train(cfg: Config, summary_writer=None):
         with torch.no_grad():
             # Update model state with latest observation embedding and last action
             obs_tensor = torch.tensor(current_obs, dtype=torch.float32, device=cfg.device).unsqueeze(0) / 255.0
-            model_state, _ = world_model.step(model_state, last_action_idx, obs_tensor)
+            model_state, _ = world_model.step(model_state, last_action_idx, obs_tensor, last_cont)
             dist = actor(model_state)
             action_idx = dist.sample().item()
 
-            # log real-env policy stats
-            if summary_writer is not None and it % cfg.log_interval == 0 and it > 0 and actor_loss is not None:
-                ent_env = dist.entropy().mean().item()
-                summary_writer.add_scalar("policy/env_entropy", ent_env, it)
-                summary_writer.add_histogram("policy/env_probs", dist.probs, it)
-
         # Overwrite action with random action if the actor is not yet trained
-        if actor_loss is None:
+        if len(buffer) <= warmup_steps:
             action_idx = env.action_space.sample()
 
         # interact with environment
@@ -155,15 +146,17 @@ def train(cfg: Config, summary_writer=None):
 
         current_obs = next_obs
         last_action_idx.fill_(action_idx)
+        last_cont.fill_(float(cont))
 
         if not cont:
             current_obs, _ = env.reset()
             model_state = world_model.init_state(1, cfg.device)
             last_action_idx.zero_()
+            last_cont.fill_(1.0)
 
         # --- When enough data collected, update the models ---
-        while len(buffer) > cfg.batch_length and update_credit >= replay_cost:
-            print(f"Update {updates_done} at iter {it}, total env steps {policy_steps}, "
+        while len(buffer) > warmup_steps and update_credit >= 1.0:
+            print(f"Update {updates_done}, total env steps {policy_steps}, "
                   f"buffer size {len(buffer)}, update credit {update_credit:.1f}")
             # --- train the world model ---
             batch = buffer.sample(cfg.batch_size)
@@ -255,12 +248,8 @@ def train(cfg: Config, summary_writer=None):
             nn.utils.clip_grad_norm_(actor.parameters(), cfg.actor_critic_grad_clip)
             optim_actor.step()
 
-            # consume credit and count this update
-            update_credit -= replay_cost
-            updates_done += 1
-
             # ---- Rich logging ----
-            if summary_writer is not None and it % cfg.log_interval == 0 and it > 0:
+            if summary_writer is not None and updates_done % cfg.log_interval == 0 and updates_done > 0:
                 with torch.no_grad():
                     # ---- Policy (imagination) ----
                     ent_im = torch.stack([d.entropy().mean() for d in imagination_dists]).mean().item()
@@ -275,79 +264,83 @@ def train(cfg: Config, summary_writer=None):
                     adv_scaled = adv / scale
 
                     # ---- Actor diagnostics ----
-                    summary_writer.add_scalar("policy/ret_scale", scale.item(), it)
-                    summary_writer.add_scalar("policy/adv_mean", adv.mean().item(), it)
-                    summary_writer.add_scalar("policy/adv_std", adv.std(unbiased=False).item(), it)
-                    summary_writer.add_scalar("policy/adv_mean_scaled", adv_scaled.mean().item(), it)
-                    summary_writer.add_scalar("policy/adv_std_scaled", adv_scaled.std(unbiased=False).item(), it)
-                    summary_writer.add_scalar("policy/imagination_entropy", ent_im, it)
-                    summary_writer.add_histogram("policy/imagination_probs", dist_im.probs, it)
+                    summary_writer.add_scalar("policy/ret_scale", scale.item(), updates_done)
+                    summary_writer.add_scalar("policy/adv_mean", adv.mean().item(), updates_done)
+                    summary_writer.add_scalar("policy/adv_std", adv.std(unbiased=False).item(), updates_done)
+                    summary_writer.add_scalar("policy/adv_mean_scaled", adv_scaled.mean().item(), updates_done)
+                    summary_writer.add_scalar("policy/adv_std_scaled", adv_scaled.std(unbiased=False).item(),
+                                              updates_done)
+                    summary_writer.add_scalar("policy/imagination_entropy", ent_im, updates_done)
+                    summary_writer.add_histogram("policy/imagination_probs", dist_im.probs, updates_done)
 
                     # ---- Critic diagnostics ----
                     val_err = (lam_returns - V).reshape(-1)
-                    summary_writer.add_scalar("value/mae_vs_returns", val_err.abs().mean().item(), it)
-                    summary_writer.add_scalar("value/bias_vs_returns", val_err.mean().item(), it)
+                    summary_writer.add_scalar("value/mae_vs_returns", val_err.abs().mean().item(), updates_done)
+                    summary_writer.add_scalar("value/bias_vs_returns", val_err.mean().item(), updates_done)
 
                     # ---- Critic/value & return stats ----
-                    summary_writer.add_scalar("value/mean", vals_vec.mean().item(), it)
-                    summary_writer.add_scalar("value/std", vals_vec.std(unbiased=False).item(), it)
-                    summary_writer.add_scalar("value/lambda_ret_mean", lam_returns.mean().item(), it)
-                    summary_writer.add_scalar("value/lambda_ret_std", lam_returns.std(unbiased=False).item(), it)
+                    summary_writer.add_scalar("value/mean", vals_vec.mean().item(), updates_done)
+                    summary_writer.add_scalar("value/std", vals_vec.std(unbiased=False).item(), updates_done)
+                    summary_writer.add_scalar("value/lambda_ret_mean", lam_returns.mean().item(), updates_done)
+                    summary_writer.add_scalar("value/lambda_ret_std", lam_returns.std(unbiased=False).item(),
+                                              updates_done)
 
                     # ---- World model breakdown (from last WM update) ----
                     wmd = world_model_tensor_dict
-                    summary_writer.add_scalar("world_model/pred_loss", wmd["pred_loss"].item(), it)
-                    summary_writer.add_scalar("world_model/dyn_loss", wmd["dyn_loss"].item(), it)
-                    summary_writer.add_scalar("world_model/rep_loss", wmd["rep_loss"].item(), it)
+                    summary_writer.add_scalar("world_model/pred_loss", wmd["pred_loss"].item(), updates_done)
+                    summary_writer.add_scalar("world_model/dyn_loss", wmd["dyn_loss"].item(), updates_done)
+                    summary_writer.add_scalar("world_model/rep_loss", wmd["rep_loss"].item(), updates_done)
 
                     # ---- Heads (reward/continue) ----
-                    summary_writer.add_scalar("world_model/rew_mean", rew_vec.mean().item(), it)
-                    summary_writer.add_scalar("world_model/rew_std", rew_vec.std(unbiased=False).item(), it)
-                    summary_writer.add_scalar("world_model/cont_mean", cont_vec.mean().item(), it)
+                    summary_writer.add_scalar("world_model/rew_mean", rew_vec.mean().item(), updates_done)
+                    summary_writer.add_scalar("world_model/rew_std", rew_vec.std(unbiased=False).item(), updates_done)
+                    summary_writer.add_scalar("world_model/cont_mean", cont_vec.mean().item(), updates_done)
 
                     # ---- Losses ----
-                    summary_writer.add_scalar("train/world_model_loss", world_model_loss.item(), it)
-                    summary_writer.add_scalar("train/actor_loss", actor_loss.item(), it)
-                    summary_writer.add_scalar("train/critic_loss", critic_loss.item(), it)
+                    summary_writer.add_scalar("train/world_model_loss", world_model_loss.item(), updates_done)
+                    summary_writer.add_scalar("train/actor_loss", actor_loss.item(), updates_done)
+                    summary_writer.add_scalar("train/critic_loss", critic_loss.item(), updates_done)
 
                     # ---- Performance ----
                     elapsed = time.time() - time_counter
                     time_counter = time.time()
-                    iters_per_second = iter_counter / elapsed
-                    iter_counter = 0
-                    summary_writer.add_scalar("perf/iters_per_second", iters_per_second, it)
+                    iters_per_second = update_counter / elapsed
+                    update_counter = 0
+                    summary_writer.add_scalar("perf/updates_per_second", iters_per_second, updates_done)
 
                     # ---- Console log ----
-                    realized_train_ratio = (updates_done * replay_cost) / max(1, policy_steps)
-                    print(f"Iters {it}, World Model Loss: {world_model_loss.item():.3f}, "
+                    realized_samples_per_env_step = updates_done / max(1, policy_steps)
+                    print(f"Update {updates_done}, World Model Loss: {world_model_loss.item():.3f}, "
                           f"Actor Loss: {actor_loss.item():.3f}, "
                           f"Critic Loss: {critic_loss.item():.3f}, "
-                          f"Realized Train Ratio: {realized_train_ratio:.3f}, "
-                          f"Iters/sec: {iters_per_second:.1f}")
+                          f"Realized Train Ratio: {realized_samples_per_env_step:.3f}, "
+                          f"Updates/sec: {iters_per_second:.3f}")
 
-        # Periodic evaluation video
-        if it % cfg.video_interval == 0 and it > 0 and summary_writer is not None and world_model_loss is not None:
-            world_model.eval()
-            actor.eval()
-            log_episode_video(cfg, summary_writer, env, world_model, actor, it)
-            log_wm_reconstruction_video(cfg, summary_writer, env, world_model, actor, it)
-            log_wm_imagination_video(cfg, summary_writer, env, world_model, actor, it)
-            world_model.train()
-            actor.train()
+            # Periodic evaluation video
+            if updates_done % cfg.video_interval == 0 and updates_done > 0 and summary_writer is not None:
+                world_model.eval()
+                actor.eval()
+                log_episode_video(cfg, summary_writer, env, world_model, actor, updates_done)
+                log_wm_reconstruction_video(cfg, summary_writer, env, world_model, actor, updates_done)
+                log_wm_imagination_video(cfg, summary_writer, env, world_model, actor, updates_done)
+                world_model.train()
+                actor.train()
 
-        # Save model
-        if it % cfg.save_interval == 0 and it > 0 and cfg.checkpoint_dir is not None and world_model_loss is not None:
-            torch.save({
-                "world_model": world_model.state_dict(),
-                "actor": actor.state_dict(),
-                "critic": critic.state_dict(),
-                "optim_world_model": optim_world_model.state_dict(),
-                "optim_actor": optim_actor.state_dict(),
-                "optim_critic": optim_critic.state_dict(),
-                "iteration": it,
-            }, os.path.join(cfg.checkpoint_dir, f"ckpt.pth"))
-            print(f"Saved model checkpoint to {cfg.checkpoint_dir}")
+            # Save model
+            if updates_done % cfg.save_interval == 0 and updates_done > 0 and cfg.checkpoint_dir is not None:
+                torch.save({
+                    "world_model": world_model.state_dict(),
+                    "actor": actor.state_dict(),
+                    "critic": critic.state_dict(),
+                    "optim_world_model": optim_world_model.state_dict(),
+                    "optim_actor": optim_actor.state_dict(),
+                    "optim_critic": optim_critic.state_dict(),
+                }, os.path.join(cfg.checkpoint_dir, f"ckpt.pth"))
+                print(f"Saved model checkpoint to {cfg.checkpoint_dir}")
 
-        iter_counter += 1
+            # consume credit and count this update
+            update_credit -= 1.0
+            updates_done += 1
+            update_counter += 1
 
     env.close()

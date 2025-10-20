@@ -1,8 +1,10 @@
+import math
+
 import gymnasium as gym
 import numpy as np
 import torch
+import torch.nn.functional as F
 from tensorboardX import SummaryWriter
-from PIL import Image
 
 from lib.config import Config
 
@@ -19,10 +21,14 @@ def log_unimix(logits: torch.Tensor, eps: float, dim: int = -1) -> torch.Tensor:
     """
     Returns log of the mixed probabilities, same shape as logits.
     """
-    probs = logits.softmax(dim=dim)
+    ls = F.log_softmax(logits, dim=dim)  # (B, L, K)
     K = logits.size(dim)
-    probs = (1.0 - eps) * probs + eps / float(K)
-    return probs.clamp_min(1e-8).log()
+    log1m = math.log1p(-float(eps))
+    log_eps_over_K = math.log(float(eps)) - math.log(float(K))
+
+    # log((1-eps)*softmax) = log_softmax + log(1-eps)
+    # log(eps/K) is a scalar; logaddexp broadcasts
+    return torch.logaddexp(ls + log1m, logits.new_tensor(log_eps_over_K))
 
 
 class ImageToPyTorch(gym.ObservationWrapper):
@@ -43,7 +49,7 @@ class ImageToPyTorch(gym.ObservationWrapper):
 
 def make_env(
         env_id: str,
-        frame_size: int = 64,
+        frame_size: int = 96,
 ) -> gym.Env:
     env = gym.make(env_id, render_mode="rgb_array")
     env = gym.wrappers.ResizeObservation(env, (frame_size, frame_size))
@@ -132,7 +138,7 @@ def log_wm_reconstruction_video(
     """
     Posterior reconstructions vs ground truth:
       - collect a short episode with actor
-      - at each step, feed x_t to encoder (posterior) and decode x_logits
+      - at each step, feed x_t to encoder (posterior) and decode x_hat
       - log side-by-side (GT | Recon)
     """
     # Collect short rollout with actions & ground-truth frames
