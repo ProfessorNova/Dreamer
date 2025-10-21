@@ -1,4 +1,3 @@
-import math
 from dataclasses import dataclass
 from typing import Tuple, Optional, Dict, Any
 
@@ -32,12 +31,11 @@ class SequenceModel(nn.Module):
         super().__init__()
         self.register_buffer("z_reset", torch.full((num_latents, classes_per_latent), 1.0 / classes_per_latent))
         self.a_emb = nn.Embedding(action_size, 64)
+        self.linear = nn.Linear(num_latents * classes_per_latent + 64, hidden_size)
 
-        self.z_proj = nn.Linear(num_latents * classes_per_latent, hidden_size)
-        self.a_proj = nn.Linear(64, hidden_size)
-
-        self.norm = nn.RMSNorm(hidden_size)
-        self.rnn = nn.GRUCell(hidden_size, hidden_size)
+        self.norm = nn.LayerNorm(hidden_size)
+        self.act = nn.SiLU()
+        self.gru = nn.GRUCell(hidden_size, hidden_size)
 
     def forward(
             self,
@@ -68,10 +66,9 @@ class SequenceModel(nn.Module):
             a_vec = a_vec * c_prev
 
         z_flat = z_prev.view(z_prev.size(0), -1)
-        x = self.z_proj(z_flat)
-        x = x.add_(self.a_proj(a_vec))
-        x = self.norm(x)
-        return self.rnn(x, h_prev)
+        x = torch.cat([z_flat, a_vec], dim=-1)
+        x = self.linear(x)
+        return self.gru(x, h_prev)
 
 
 class Encoder(nn.Module):
@@ -95,10 +92,18 @@ class Encoder(nn.Module):
         self.num_latents, self.classes_per_latent = num_latents, classes_per_latent
 
         self.conv = nn.Sequential(
-            nn.Conv2d(C, base_cnn_channels, 4, stride=2, padding=1), nn.SiLU(),
-            nn.Conv2d(base_cnn_channels, 2 * base_cnn_channels, 4, stride=2, padding=1), nn.SiLU(),
-            nn.Conv2d(2 * base_cnn_channels, 4 * base_cnn_channels, 4, stride=2, padding=1), nn.SiLU(),
-            nn.Conv2d(4 * base_cnn_channels, 8 * base_cnn_channels, 4, stride=2, padding=1), nn.SiLU(),
+            nn.Conv2d(C, base_cnn_channels, 4, stride=2, padding=1),
+            nn.LayerNorm([base_cnn_channels, H // 2, W // 2]),
+            nn.SiLU(),
+            nn.Conv2d(base_cnn_channels, 2 * base_cnn_channels, 4, stride=2, padding=1),
+            nn.LayerNorm([2 * base_cnn_channels, H // 4, W // 4]),
+            nn.SiLU(),
+            nn.Conv2d(2 * base_cnn_channels, 4 * base_cnn_channels, 4, stride=2, padding=1),
+            nn.LayerNorm([4 * base_cnn_channels, H // 8, W // 8]),
+            nn.SiLU(),
+            nn.Conv2d(4 * base_cnn_channels, 8 * base_cnn_channels, 4, stride=2, padding=1),
+            nn.LayerNorm([8 * base_cnn_channels, H // 16, W // 16]),
+            nn.SiLU(),
             nn.Flatten(),
         )
 
@@ -124,7 +129,7 @@ class Encoder(nn.Module):
         B, C, H, W = x_t.shape
         assert (C, H, W) == (self.C, self.H, self.W), f"Got {(C, H, W)}, expected {(self.C, self.H, self.W)}"
         conv_out = self.conv(x_t)
-        combined = torch.cat([conv_out, h_t.detach()], dim=-1)
+        combined = torch.cat([conv_out, h_t], dim=-1)
         logits = self.fc(combined).view(-1, self.num_latents, self.classes_per_latent)
         return logits
 
@@ -149,8 +154,8 @@ class DynamicsPredictor(nn.Module):
         dim = hidden_size
         for _ in range(mlp_layers):
             layers.append(nn.Linear(dim, mlp_hidden_units))
+            layers.append(nn.LayerNorm(mlp_hidden_units))
             layers.append(nn.SiLU())
-            layers.append(nn.RMSNorm(mlp_hidden_units))
             dim = mlp_hidden_units
         self.mlp = nn.Sequential(*layers)
         self.head = nn.Linear(mlp_hidden_units, num_latents * classes_per_latent)
@@ -180,7 +185,7 @@ class RewardPredictor(nn.Module):
             num_latents: int = 32,
             classes_per_latent: int = 32,
             mlp_hidden_units: int = 512,
-            mlp_layers: int = 1,
+            mlp_layers: int = 3,
     ):
         super().__init__()
 
@@ -188,8 +193,8 @@ class RewardPredictor(nn.Module):
         dim = hidden_size + num_latents * classes_per_latent
         for _ in range(mlp_layers):
             layers.append(nn.Linear(dim, mlp_hidden_units))
+            layers.append(nn.LayerNorm(mlp_hidden_units))
             layers.append(nn.SiLU())
-            layers.append(nn.RMSNorm(mlp_hidden_units))
             dim = mlp_hidden_units
         self.mlp = nn.Sequential(*layers)
         self.head = nn.Linear(mlp_hidden_units, 1)
@@ -224,7 +229,7 @@ class ContinuePredictor(nn.Module):
             num_latents: int = 32,
             classes_per_latent: int = 32,
             mlp_hidden_units: int = 512,
-            mlp_layers: int = 1,
+            mlp_layers: int = 3,
     ):
         super().__init__()
 
@@ -232,8 +237,8 @@ class ContinuePredictor(nn.Module):
         dim = h_dim + num_latents * classes_per_latent
         for _ in range(mlp_layers):
             layers.append(nn.Linear(dim, mlp_hidden_units))
+            layers.append(nn.LayerNorm(mlp_hidden_units))
             layers.append(nn.SiLU())
-            layers.append(nn.RMSNorm(mlp_hidden_units))
             dim = mlp_hidden_units
         self.mlp = nn.Sequential(*layers)
         self.head = nn.Linear(mlp_hidden_units, 1)
@@ -276,8 +281,6 @@ class Decoder(nn.Module):
         self.base_h, self.base_w = H // 16, W // 16
         self.cnn_multiplier = base_cnn_channels
 
-        B = base_cnn_channels
-
         self.fc = nn.Sequential(
             nn.Linear(hidden_size + num_latents * classes_per_latent,
                       base_cnn_channels * 8 * self.base_h * self.base_w),
@@ -285,9 +288,15 @@ class Decoder(nn.Module):
         )
 
         self.deconv = nn.Sequential(
-            nn.ConvTranspose2d(8 * base_cnn_channels, 4 * base_cnn_channels, 4, stride=2, padding=1), nn.SiLU(),
-            nn.ConvTranspose2d(4 * base_cnn_channels, 2 * base_cnn_channels, 4, stride=2, padding=1), nn.SiLU(),
-            nn.ConvTranspose2d(2 * base_cnn_channels, base_cnn_channels, 4, stride=2, padding=1), nn.SiLU(),
+            nn.ConvTranspose2d(8 * base_cnn_channels, 4 * base_cnn_channels, 4, stride=2, padding=1),
+            nn.LayerNorm([4 * base_cnn_channels, self.base_h * 2, self.base_w * 2]),
+            nn.SiLU(),
+            nn.ConvTranspose2d(4 * base_cnn_channels, 2 * base_cnn_channels, 4, stride=2, padding=1),
+            nn.LayerNorm([2 * base_cnn_channels, self.base_h * 4, self.base_w * 4]),
+            nn.SiLU(),
+            nn.ConvTranspose2d(2 * base_cnn_channels, base_cnn_channels, 4, stride=2, padding=1),
+            nn.LayerNorm([base_cnn_channels, self.base_h * 8, self.base_w * 8]),
+            nn.SiLU(),
             nn.ConvTranspose2d(base_cnn_channels, C, 4, stride=2, padding=1),
             nn.Sigmoid(),
         )
@@ -368,14 +377,14 @@ class WorldModel(nn.Module):
             num_latents=num_latents,
             classes_per_latent=classes_per_latent,
             mlp_hidden_units=mlp_hidden_units,
-            mlp_layers=1,
+            mlp_layers=3,
         )
         self.cont = ContinuePredictor(
             h_dim=hidden_size,
             num_latents=num_latents,
             classes_per_latent=classes_per_latent,
             mlp_hidden_units=mlp_hidden_units,
-            mlp_layers=1,
+            mlp_layers=3,
         )
         self.dec = Decoder(
             obs_shape=obs_shape,
@@ -526,7 +535,7 @@ class WorldModel(nn.Module):
             init_state: Optional[WorldModelState] = None,
     ) -> tuple[Tensor, dict[str, Any]]:
         """
-        Roll out a subsequence of length T and compute DreamerV3 world-model loss.
+        Roll out a subsequence of length T and compute world-model loss.
         Returns (total_loss, metrics_dict).
         """
         B, T = obs.size(0), obs.size(1)

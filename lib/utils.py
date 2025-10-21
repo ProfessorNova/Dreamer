@@ -49,7 +49,7 @@ class ImageToPyTorch(gym.ObservationWrapper):
 
 def make_env(
         env_id: str,
-        frame_size: int = 96,
+        frame_size: int = 64,
 ) -> gym.Env:
     env = gym.make(env_id, render_mode="rgb_array")
     env = gym.wrappers.ResizeObservation(env, (frame_size, frame_size))

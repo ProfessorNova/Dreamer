@@ -107,10 +107,10 @@ def train(cfg: Config, summary_writer=None):
 
     # Logic for train ratio
     update_credit = 0.0  # accumulated replayed steps
+    credits_per_update = cfg.batch_size * cfg.batch_length  # replayed steps per WM update
     updates_done = 0  # total gradient updates run
     update_counter = 0  # counts updates for perf logging
     policy_steps = 0  # total env steps (= policy steps)
-    warmup_steps = (cfg.batch_size * cfg.train_ratio) * 3 + cfg.batch_length
 
     model_state = world_model.init_state(1, cfg.device)
     last_action_idx = torch.zeros(1, dtype=torch.long, device=cfg.device)
@@ -131,7 +131,7 @@ def train(cfg: Config, summary_writer=None):
             action_idx = dist.sample().item()
 
         # Overwrite action with random action if the actor is not yet trained
-        if len(buffer) <= warmup_steps:
+        if updates_done == 0:
             action_idx = env.action_space.sample()
 
         # interact with environment
@@ -139,10 +139,6 @@ def train(cfg: Config, summary_writer=None):
         cont = not (terminated or truncated)
 
         buffer.store(current_obs, action_idx, float(reward), cont)
-
-        # for later when doing updates
-        policy_steps += 1
-        update_credit += cfg.train_ratio
 
         current_obs = next_obs
         last_action_idx.fill_(action_idx)
@@ -154,8 +150,12 @@ def train(cfg: Config, summary_writer=None):
             last_action_idx.zero_()
             last_cont.fill_(1.0)
 
+        # For train ratio logic
+        policy_steps += 1
+        update_credit += cfg.train_ratio
+
         # --- When enough data collected, update the models ---
-        while len(buffer) > warmup_steps and update_credit >= 1.0:
+        while len(buffer) > cfg.batch_length and update_credit >= credits_per_update:
             print(f"Update {updates_done}, total env steps {policy_steps}, "
                   f"buffer size {len(buffer)}, update credit {update_credit:.1f}")
             # --- train the world model ---
@@ -309,11 +309,9 @@ def train(cfg: Config, summary_writer=None):
                     summary_writer.add_scalar("perf/updates_per_second", iters_per_second, updates_done)
 
                     # ---- Console log ----
-                    realized_samples_per_env_step = updates_done / max(1, policy_steps)
                     print(f"Update {updates_done}, World Model Loss: {world_model_loss.item():.3f}, "
                           f"Actor Loss: {actor_loss.item():.3f}, "
                           f"Critic Loss: {critic_loss.item():.3f}, "
-                          f"Realized Train Ratio: {realized_samples_per_env_step:.3f}, "
                           f"Updates/sec: {iters_per_second:.3f}")
 
             # Periodic evaluation video
@@ -339,7 +337,7 @@ def train(cfg: Config, summary_writer=None):
                 print(f"Saved model checkpoint to {cfg.checkpoint_dir}")
 
             # consume credit and count this update
-            update_credit -= 1.0
+            update_credit -= credits_per_update
             updates_done += 1
             update_counter += 1
 

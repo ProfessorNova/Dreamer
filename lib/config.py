@@ -8,16 +8,16 @@ import torch
 @dataclass
 class Config:
     # --- Environment and device settings ---
-    env_id: str = "ALE/Pong-v5"
+    env_id: str = "ALE/MsPacman-v5"
     device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # --- Hyperparameters ---
     # General
-    num_iterations: int = 100_000
+    num_iterations: int = 1_000_000
     replay_capacity: int = 100_000
     batch_size: int = 16
     batch_length: int = 64
-    train_ratio: int = 8.0
+    train_ratio: int = 1024.0
 
     # World Model
     num_latents = 32

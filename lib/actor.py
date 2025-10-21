@@ -61,8 +61,8 @@ class Actor(nn.Module):
         dim = state_size
         for _ in range(mlp_layers):
             layers.append(nn.Linear(dim, mlp_hidden_units))
+            layers.append(nn.LayerNorm(mlp_hidden_units))
             layers.append(nn.SiLU())
-            layers.append(nn.RMSNorm(mlp_hidden_units))
             dim = mlp_hidden_units
         self.mlp = nn.Sequential(*layers)
         self.head = nn.Linear(mlp_hidden_units, action_size)
