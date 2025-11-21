@@ -208,22 +208,20 @@ def train(cfg: Config, summary_writer=None):
                 R = torch.stack(imagination_rewards, dim=1)  # (B,H)
                 C = torch.stack(imagination_cont_prob, dim=1)  # (B,H)
 
-                discounts = cfg.gamma * C  # (B,H)
-
                 V = critic.value(Hs)  # (B,H)
                 V_last = critic.value(WorldModelState(
                     h=imagination_states[-1].h,
                     z=imagination_states[-1].z
                 ))  # (B,)
 
-                lam = cfg.lam
-                lam_returns = torch.empty_like(V)  # (B,H)
-                last = V_last  # bootstrap scalar per batch
+                lam_returns = torch.zeros_like(V)
+                next_ret = V_last
                 for t in reversed(range(H)):
-                    # G^lam_t = r_t + d_t * ((1-lam) * V_{t+1} + lam * G^lam_{t+1})
-                    next_v = V[:, t + 1] if t < H - 1 else V_last
-                    last = R[:, t] + discounts[:, t] * ((1.0 - lam) * next_v + lam * last)
-                    lam_returns[:, t] = last
+                    ret = R[:, t] + cfg.gamma * (1.0 - C[:, t]) * (
+                            (1.0 - cfg.lam) * V[:, t] + cfg.lam * next_ret
+                    )
+                    lam_returns[:, t] = ret
+                    next_ret = ret
 
             # ---- Critic update ----
             critic_loss = critic.loss(

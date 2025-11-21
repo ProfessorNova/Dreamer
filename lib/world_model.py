@@ -29,7 +29,6 @@ class SequenceModel(nn.Module):
             hidden_size: int = 512,
     ):
         super().__init__()
-        self.register_buffer("z_reset", torch.full((num_latents, classes_per_latent), 1.0 / classes_per_latent))
         self.a_emb = nn.Embedding(action_size, 64)
         self.linear = nn.Linear(num_latents * classes_per_latent + 64, hidden_size)
 
@@ -57,8 +56,9 @@ class SequenceModel(nn.Module):
         # reset hidden state and z if c_prev is 0
         if c_prev is not None:
             h_prev = h_prev * c_prev
+            z_reset = F.gumbel_softmax(torch.full_like(z_prev, 1.0 / z_prev.size(-1)), tau=1, hard=True, dim=-1)
             m = c_prev.view(-1, 1, 1)
-            z_prev = z_prev * m + (1.0 - m) * self.z_reset.unsqueeze(0)
+            z_prev = z_prev * m + (1.0 - m) * z_reset
 
         # embed and set action to zero if c_prev is 0
         a_vec = self.a_emb(a_prev_idx)
@@ -403,12 +403,13 @@ class WorldModel(nn.Module):
     @torch.no_grad()
     def init_state(self, batch_size: int, device=None, dtype=None) -> WorldModelState:
         h0 = torch.zeros(batch_size, self.hidden_size, device=device, dtype=dtype)
-        z0 = torch.full(
+        z0_logits = torch.full(
             (batch_size, self.num_latents, self.classes_per_latent),
             1.0 / self.classes_per_latent,
             device=device,
             dtype=dtype,
         )
+        z0 = F.gumbel_softmax(z0_logits, tau=1, hard=True, dim=-1)
         return WorldModelState(h=h0, z=z0)
 
     def step(

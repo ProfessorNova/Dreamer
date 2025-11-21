@@ -8,7 +8,7 @@ import torch
 @dataclass
 class Config:
     # --- Environment and device settings ---
-    env_id: str = "ALE/MsPacman-v5"
+    env_id: str = "ALE/Pong-v5"
     device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # --- Hyperparameters ---
